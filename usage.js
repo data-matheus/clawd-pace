@@ -1,335 +1,251 @@
 'use strict';
 
-// Scans ~/.claude/projects/**/*.jsonl and aggregates token usage from every
-// assistant message. Parsing is incremental: each file's contribution is cached
-// keyed by mtime+size, so a refresh only re-reads files that actually changed.
+// Local activity stats from Claude Code's own session logs
+// (~/.claude/projects/**/*.jsonl). Runs inside a worker thread (usage-worker.js)
+// so a big first scan never freezes the pet.
+//
+// Incremental: logs are append-only, so each file remembers the byte offset it
+// was parsed up to and only the new bytes are read on the next scan. The
+// per-file aggregates are persisted, so a reboot doesn't re-read gigabytes.
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
 const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
+const CACHE_VERSION = 3;
+const CHUNK = 4 * 1024 * 1024;
 
-// cache: filePath -> { sig, totals, models, daily, ids:Set }
-const fileCache = new Map();
-
-function emptyTotals() {
-  return {
-    input: 0,
-    output: 0,
-    cacheCreate: 0,
-    cacheRead: 0,
-    messages: 0,
-    cost: 0, // estimated USD at public API rates
-  };
-}
-
-// Public Anthropic API prices (USD per million tokens). Used to estimate the
-// "equivalent API cost" — on a subscription you don't actually pay this, it just
-// shows how much value you'd have spent on the API.
-const PRICING = {
-  opus: { in: 15, out: 75, cw: 18.75, cr: 1.5 },
-  sonnet: { in: 3, out: 15, cw: 3.75, cr: 0.3 },
-  haiku: { in: 1, out: 5, cw: 1.25, cr: 0.1 },
-  default: { in: 3, out: 15, cw: 3.75, cr: 0.3 },
-};
-function rateFor(model) {
-  const m = String(model);
-  if (/opus/.test(m)) return PRICING.opus;
-  if (/sonnet/.test(m)) return PRICING.sonnet;
-  if (/haiku/.test(m)) return PRICING.haiku;
-  return PRICING.default;
-}
-function msgCost(model, inp, out, cc, cr) {
-  const r = rateFor(model);
-  return (inp * r.in + out * r.out + cc * r.cw + cr * r.cr) / 1e6;
-}
-
-function listJsonlFiles(dir) {
-  const out = [];
-  let entries;
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return out;
+// Public API prices, USD per million tokens: [input, output, cacheRead].
+// Cache writes: 1.25x input (5 min) / 2x input (1 h). On a subscription you
+// don't pay this — it's the "what this would cost on the API" value.
+const PRICES = [
+  [/fable-5-1|mythos-5-1/, [10, 50, 0.25]],
+  [/fable|mythos/, [10, 50, 1]],
+  [/opus-5-5/, [4, 20, 0.2]],
+  [/opus-5|opus-4-[5-9]/, [5, 25, 0.5]],
+  [/opus/, [15, 75, 1.5]],
+  [/sonnet-5/, [2, 10, 0.2]],
+  [/sonnet/, [3, 15, 0.3]],
+  [/haiku-5/, [0.1, 0.5, 0.01]],
+  [/haiku/, [1, 5, 0.1]],
+];
+const DEFAULT_PRICE = [3, 15, 0.3];
+const priceCache = new Map();
+function priceFor(model) {
+  if (!priceCache.has(model)) {
+    const m = String(model);
+    const hit = m === '<synthetic>' ? [0, 0, 0] : (PRICES.find(([re]) => re.test(m)) || [null, DEFAULT_PRICE])[1];
+    priceCache.set(model, hit);
   }
+  return priceCache.get(model);
+}
+
+function msgCost(model, u) {
+  const [pin, pout, pcr] = priceFor(model);
+  const inp = u.input_tokens || 0;
+  const out = u.output_tokens || 0;
+  const cr = u.cache_read_input_tokens || 0;
+  const cc = u.cache_creation_input_tokens || 0;
+  const c1h = (u.cache_creation && u.cache_creation.ephemeral_1h_input_tokens) || 0;
+  const c5m = Math.max(0, cc - c1h);
+  return (inp * pin + out * pout + cr * pcr + c5m * pin * 1.25 + c1h * pin * 2) / 1e6;
+}
+
+function localDay(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function listJsonl(dir, out = []) {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
   for (const e of entries) {
     const full = path.join(dir, e.name);
-    if (e.isDirectory()) out.push(...listJsonlFiles(full));
+    if (e.isDirectory()) listJsonl(full, out);
     else if (e.isFile() && e.name.endsWith('.jsonl')) out.push(full);
   }
   return out;
 }
 
-function parseFile(filePath) {
-  const totals = emptyTotals();
-  const models = Object.create(null); // model -> totals
-  const daily = Object.create(null); // YYYY-MM-DD -> totals
-  const ids = new Set(); // message ids seen in this file (dedupe)
-  let cwd = null; // working dir of this session (for per-project stats)
+function emptyEntry() {
+  return { offset: 0, size: 0, mtime: 0, ids: [], cwd: null, last: 0, days: {} };
+}
 
-  let content;
+// Parse bytes [entry.offset, size) of a file into entry (mutates).
+function parseIncrement(fp, entry, size) {
+  let fd;
+  try { fd = fs.openSync(fp, 'r'); } catch { return; }
+  const ids = new Set(entry.ids);
+  const recent = entry.ids.slice();
+  let pos = entry.offset;
+  let carry = '';
+  const buf = Buffer.allocUnsafe(CHUNK);
   try {
-    content = fs.readFileSync(filePath, 'utf8');
-  } catch {
-    return { totals, models, daily, ids, cwd };
+    while (pos < size) {
+      const n = fs.readSync(fd, buf, 0, Math.min(CHUNK, size - pos), pos);
+      if (n <= 0) break;
+      pos += n;
+      const text = carry + buf.toString('utf8', 0, n);
+      const lines = text.split('\n');
+      carry = lines.pop(); // incomplete last line -> next chunk / next scan
+      for (const line of lines) handleLine(line, entry, ids, recent);
+    }
+  } finally {
+    fs.closeSync(fd);
   }
-
-  for (const line of content.split('\n')) {
-    if (!line) continue;
-    let obj;
-    try {
-      obj = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    const msg = obj && obj.message;
-    if (!msg || typeof msg !== 'object') continue;
-    const u = msg.usage;
-    if (!u || typeof u !== 'object') continue;
-
-    // Dedupe repeated streaming records of the same message within this file.
-    const id = msg.id;
-    if (id) {
-      if (ids.has(id)) continue;
-      ids.add(id);
-    }
-
-    if (!cwd && typeof obj.cwd === 'string') cwd = obj.cwd;
-
-    const inp = u.input_tokens || 0;
-    const out = u.output_tokens || 0;
-    const cc = u.cache_creation_input_tokens || 0;
-    const cr = u.cache_read_input_tokens || 0;
-    const model = msg.model || 'unknown';
-    const cost = msgCost(model, inp, out, cc, cr);
-
-    totals.input += inp;
-    totals.output += out;
-    totals.cacheCreate += cc;
-    totals.cacheRead += cr;
-    totals.cost += cost;
-    totals.messages += 1;
-
-    if (!models[model]) models[model] = emptyTotals();
-    models[model].input += inp;
-    models[model].output += out;
-    models[model].cacheCreate += cc;
-    models[model].cacheRead += cr;
-    models[model].cost += cost;
-    models[model].messages += 1;
-
-    const ts = obj.timestamp;
-    if (ts) {
-      const day = localDay(new Date(ts)); // bucket by the user's local day
-      if (!daily[day]) daily[day] = emptyTotals();
-      daily[day].input += inp;
-      daily[day].output += out;
-      daily[day].cacheCreate += cc;
-      daily[day].cacheRead += cr;
-      daily[day].cost += cost;
-      daily[day].messages += 1;
-    }
-  }
-  return { totals, models, daily, ids, cwd };
+  // Only advance past complete lines; a half-written last line is re-read later.
+  entry.offset = pos - Buffer.byteLength(carry, 'utf8');
+  entry.ids = recent.slice(-64);
 }
 
-function mergeTotals(dst, src) {
-  dst.cost += src.cost || 0;
-  dst.input += src.input;
-  dst.output += src.output;
-  dst.cacheCreate += src.cacheCreate;
-  dst.cacheRead += src.cacheRead;
-  dst.messages += src.messages;
+function handleLine(line, entry, ids, recent) {
+  if (!line || line.indexOf('"usage"') === -1) {
+    if (!entry.cwd && line && line.indexOf('"cwd"') !== -1) {
+      try { const o = JSON.parse(line); if (typeof o.cwd === 'string') entry.cwd = o.cwd; } catch { /* skip */ }
+    }
+    return;
+  }
+  let obj;
+  try { obj = JSON.parse(line); } catch { return; }
+  if (!entry.cwd && typeof obj.cwd === 'string') entry.cwd = obj.cwd;
+  const msg = obj && obj.message;
+  const u = msg && msg.usage;
+  if (!u || typeof u !== 'object') return;
+  const id = msg.id && (msg.id + ':' + (obj.requestId || ''));
+  if (id) {
+    if (ids.has(id)) return; // same message streamed over several lines
+    ids.add(id);
+    recent.push(id);
+  }
+  const model = msg.model || 'unknown';
+  if (model === '<synthetic>') return;
+  const ts = obj.timestamp ? new Date(obj.timestamp) : null;
+  if (!ts || isNaN(ts)) return;
+  const tok = (u.input_tokens || 0) + (u.output_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+  const cost = msgCost(model, u);
+  const day = localDay(ts);
+  const d = entry.days[day] || (entry.days[day] = { m: 0, t: 0, o: 0, c: 0, h: new Array(24).fill(0), mod: {} });
+  d.m += 1;
+  d.t += tok;
+  d.o += u.output_tokens || 0;
+  d.c += cost;
+  d.h[ts.getHours()] += 1;
+  d.mod[model] = (d.mod[model] || 0) + cost;
+  const t = ts.getTime();
+  if (t > entry.last) entry.last = t;
 }
 
-function collectUsage() {
-  const files = listJsonlFiles(PROJECTS_DIR);
-  const seen = new Set(files);
-
-  // Drop cache entries for files that no longer exist.
-  for (const key of [...fileCache.keys()]) {
-    if (!seen.has(key)) fileCache.delete(key);
-  }
-
-  for (const fp of files) {
-    let stat;
-    try {
-      stat = fs.statSync(fp);
-    } catch {
-      continue;
-    }
-    const sig = `${stat.mtimeMs}:${stat.size}`;
-    const cached = fileCache.get(fp);
-    if (cached && cached.sig === sig) continue;
-    const parsed = parseFile(fp);
-    fileCache.set(fp, { sig, ...parsed });
-  }
-
-  // Aggregate across all cached files.
-  const totals = emptyTotals();
-  const models = Object.create(null);
-  const daily = Object.create(null);
-
-  const projects = Object.create(null); // cwd -> { tokens, cost }
-  for (const { totals: t, models: m, daily: d, cwd } of fileCache.values()) {
-    mergeTotals(totals, t);
-    for (const [model, mt] of Object.entries(m)) {
-      if (!models[model]) models[model] = emptyTotals();
-      mergeTotals(models[model], mt);
-    }
-    for (const [day, dt] of Object.entries(d)) {
-      if (!daily[day]) daily[day] = emptyTotals();
-      mergeTotals(daily[day], dt);
-    }
-    if (cwd) {
-      if (!projects[cwd]) projects[cwd] = { tokens: 0, cost: 0 };
-      projects[cwd].tokens += t.input + t.output + t.cacheCreate + t.cacheRead;
-      projects[cwd].cost += t.cost || 0;
-    }
-  }
-
-  const grand =
-    totals.input + totals.output + totals.cacheCreate + totals.cacheRead;
-
-  // Grand total + cost per local day.
-  const dayGrand = Object.create(null);
-  const dayCost = Object.create(null);
-  for (const [day, t] of Object.entries(daily)) {
-    dayGrand[day] = t.input + t.output + t.cacheCreate + t.cacheRead;
-    dayCost[day] = t.cost || 0;
-  }
-
-  const now = new Date();
-  const todayKey = localDay(now);
-  const todayGrand = dayGrand[todayKey] || 0;
-
-  // Last 7 local days (oldest -> newest), for the bar chart + weekly totals.
-  const last7 = [];
-  for (let i = 6; i >= 0; i--) {
-    const d = new Date(now);
-    d.setDate(d.getDate() - i);
-    const k = localDay(d);
-    last7.push({ day: k, dow: d.getDay(), total: dayGrand[k] || 0, cost: dayCost[k] || 0 });
-  }
-  const weekTotal = last7.reduce((s, x) => s + x.total, 0);
-
-  // Cost over ranges (sum the daily cost buckets).
-  let weekCost = 0, cost30 = 0, tok30 = 0, msg30 = 0;
-  for (let i = 0; i < 30; i++) {
-    const k = localDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() - i));
-    cost30 += dayCost[k] || 0;
-    tok30 += dayGrand[k] || 0;
-    if (daily[k]) msg30 += daily[k].messages;
-    if (i < 7) weekCost += dayCost[k] || 0;
-  }
-
-  // ---- streak: consecutive days with any usage (real, from logs) ----
-  const used = (k) => (dayGrand[k] || 0) > 0;
-  const dayKeyBack = (i) => localDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() - i));
-  let curStreak = 0;
-  for (let i = used(todayKey) ? 0 : 1; ; i++) {
-    if (used(dayKeyBack(i))) curStreak++;
-    else break;
-  }
-  // best streak across all recorded days
-  const allDays = Object.keys(dayGrand).filter((k) => dayGrand[k] > 0).sort();
-  let bestStreak = 0, run = 0, prev = null;
-  for (const k of allDays) {
-    const t = new Date(k + 'T00:00:00').getTime();
-    run = prev !== null && t - prev === 86400000 ? run + 1 : 1;
-    if (run > bestStreak) bestStreak = run;
-    prev = t;
-  }
-
-  // Top project by tokens.
-  let topProject = null;
-  for (const [cwd, p] of Object.entries(projects)) {
-    if (!topProject || p.tokens > topProject.tokens) {
-      topProject = { name: cwd.split('/').filter(Boolean).pop() || cwd, tokens: p.tokens, cost: p.cost };
-    }
-  }
-
-  // Real reference points from the user's own history (no invented quota):
-  // busiest single day in the last 30 days, busiest rolling 7-day window in 9 weeks.
-  const series = [];
-  for (let i = 0; i < 66; i++) {
-    const d = new Date(now);
-    d.setDate(d.getDate() - i);
-    series.push(dayGrand[localDay(d)] || 0); // index 0 = today, increasing = older
-  }
-  const peakDay = Math.max(0, ...series.slice(0, 30));
-  let peakWeek = 0;
-  for (let i = 0; i + 7 <= series.length; i++) {
-    let s = 0;
-    for (let j = 0; j < 7; j++) s += series[i + j];
-    if (s > peakWeek) peakWeek = s;
-  }
-
-  // Top models by grand total tokens.
-  const modelList = Object.entries(models)
-    .map(([name, t]) => ({
-      name,
-      total: t.input + t.output + t.cacheCreate + t.cacheRead,
-      ...t,
-    }))
-    .filter((m) => m.total > 0)
-    .sort((a, b) => b.total - a.total);
-
-  const todayTotals = daily[todayKey] || emptyTotals();
-
-  return {
-    grand,
-    totals,
-    todayGrand,
-    today: todayTotals,
-    last7,
-    weekTotal,
-    peakDay,
-    peakWeek,
-    limits: readLimits(), // real, user-provided plan limits (or nulls)
-    models: modelList,
-    fileCount: files.length,
-    // --- cost (estimated USD at API rates) ---
-    cost: {
-      total: totals.cost,
-      today: todayTotals.cost || 0,
-      week: weekCost,
-      last30: cost30,
-    },
-    // --- activity stats ---
-    stats: {
-      messages: totals.messages,
-      sessions: files.length,
-      topProject, // { name, tokens, cost } or null
-      tokens30: tok30,
-      messages30: msg30,
-      activeDays: allDays.length,
-    },
-    streak: { current: curStreak, best: bestStreak },
-    updatedAt: Date.now(),
-  };
-}
-
-// Local YYYY-MM-DD for the machine's timezone.
-function localDay(d) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
-
-// Optional real plan limits the user copies from `/usage` into a config file.
-// Nothing is invented — if the file/keys are absent, limits stay null.
-const CONFIG_PATH = path.join(os.homedir(), '.config', 'claude-usage-pet.json');
-function readLimits() {
+function createScanner(cacheFile) {
+  let cache = {};
   try {
-    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-    const num = (v) => (typeof v === 'number' && v > 0 ? v : null);
-    return { daily: num(cfg.dailyLimit), weekly: num(cfg.weeklyLimit) };
-  } catch {
-    return { daily: null, weekly: null };
+    const j = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+    if (j && j.v === CACHE_VERSION) cache = j.files || {};
+  } catch { /* first run */ }
+
+  function save() {
+    try {
+      fs.writeFileSync(cacheFile + '.tmp', JSON.stringify({ v: CACHE_VERSION, files: cache }));
+      fs.renameSync(cacheFile + '.tmp', cacheFile);
+    } catch { /* ignore */ }
   }
+
+  function scan() {
+    const t0 = Date.now();
+    const files = listJsonl(PROJECTS_DIR);
+    const seen = new Set(files);
+    let changed = false;
+    for (const k of Object.keys(cache)) if (!seen.has(k)) { delete cache[k]; changed = true; }
+
+    for (const fp of files) {
+      let st;
+      try { st = fs.statSync(fp); } catch { continue; }
+      let e = cache[fp];
+      if (e && e.size === st.size && e.mtime === st.mtimeMs) continue;
+      if (!e || st.size < e.offset) e = cache[fp] = emptyEntry(); // new or rewritten
+      parseIncrement(fp, e, st.size);
+      e.size = st.size;
+      e.mtime = st.mtimeMs;
+      changed = true;
+    }
+    if (changed) save();
+    return summarize(files.length, Date.now() - t0);
+  }
+
+  function summarize(fileCount, scanMs) {
+    const now = new Date();
+    const dayKey = (back) => localDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() - back));
+    const keys7 = Array.from({ length: 7 }, (_, i) => dayKey(6 - i)); // oldest -> today
+    const set7 = new Set(keys7);
+    const set30 = new Set(Array.from({ length: 30 }, (_, i) => dayKey(i)));
+
+    const zero = () => ({ m: 0, t: 0, o: 0, c: 0 });
+    const add = (a, d) => { a.m += d.m; a.t += d.t; a.o += d.o; a.c += d.c; };
+    const byDay = {};
+    const all = zero();
+    const week = zero();
+    const last30 = zero();
+    const hours7 = new Array(24).fill(0);
+    const models7 = {};
+    const projects7 = {};
+    let lastActivity = 0;
+
+    for (const e of Object.values(cache)) {
+      if (e.last > lastActivity) lastActivity = e.last;
+      const proj = e.cwd ? e.cwd.split(/[\\/]/).filter(Boolean).pop() : null;
+      for (const [day, d] of Object.entries(e.days)) {
+        add(all, d);
+        const bd = byDay[day] || (byDay[day] = zero());
+        add(bd, d);
+        if (set30.has(day)) add(last30, d);
+        if (set7.has(day)) {
+          add(week, d);
+          for (let h = 0; h < 24; h++) hours7[h] += d.h[h];
+          for (const [m, c] of Object.entries(d.mod)) models7[m] = (models7[m] || 0) + c;
+          if (proj) projects7[proj] = (projects7[proj] || 0) + d.c;
+        }
+      }
+    }
+
+    const today = byDay[dayKey(0)] || zero();
+    const todayHours = new Array(24).fill(0);
+    for (const e of Object.values(cache)) {
+      const d = e.days[dayKey(0)];
+      if (d) for (let h = 0; h < 24; h++) todayHours[h] += d.h[h];
+    }
+
+    let streak = 0;
+    for (let i = today.m > 0 ? 0 : 1; i < 400; i++) {
+      if (byDay[dayKey(i)] && byDay[dayKey(i)].m > 0) streak++;
+      else break;
+    }
+    const activeDays30 = [...set30].filter((k) => byDay[k] && byDay[k].m > 0).length;
+    const prettyModel = (m) => m.replace(/^claude-/, '').replace(/^./, (c) => c.toUpperCase()).replace(/-(\d)-(\d)$/, ' $1.$2').replace(/-(\d)$/, ' $1');
+    const modelsWeek = Object.entries(models7)
+      .map(([name, c]) => ({ name: prettyModel(name), c }))
+      .sort((a, b) => b.c - a.c);
+    const topProject = Object.entries(projects7).sort((a, b) => b[1] - a[1])[0] || null;
+
+    return {
+      today,
+      todayHours,
+      week,
+      last30,
+      all,
+      allDays: Object.keys(byDay).length,
+      last7: keys7.map((k) => ({ day: k, dow: new Date(k + 'T12:00:00').getDay(), ...(byDay[k] || zero()) })),
+      hours7,
+      modelsWeek,
+      topProject: topProject ? { name: topProject[0], c: topProject[1] } : null,
+      activeDays30,
+      streak,
+      lastActivity,
+      files: fileCount,
+      scanMs,
+      updatedAt: Date.now(),
+    };
+  }
+
+  return { scan };
 }
 
-module.exports = { collectUsage, PROJECTS_DIR, CONFIG_PATH };
+module.exports = { createScanner, PROJECTS_DIR, msgCost, priceFor };

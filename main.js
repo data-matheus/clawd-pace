@@ -1,599 +1,696 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, screen, Menu, Tray, nativeImage, Notification } = require('electron');
+// Clawd Pace — a desktop Clawd that shows, at a glance, how fast you're burning
+// your Claude plan (5h session + weekly). Fork of plugin87/claude-usage-pet (MIT).
+
+const { app, BrowserWindow, ipcMain, screen, Menu, Tray, nativeImage, Notification, shell, powerMonitor } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { collectUsage } = require('./usage');
-const { fetchLimits } = require('./limits');
-const game = require('./game');
+const os = require('os');
+const { Worker } = require('worker_threads');
+const { fetchLimits, CRED_FILES } = require('./limits');
+const { computePace } = require('./pace');
+const { createHistory } = require('./history');
+const { PROJECTS_DIR } = require('./usage');
+const { trayIcon } = require('./trayicon');
 
-// ---------------- user settings (persisted) ----------------
-const settings = { menuBarMetric: 'weekly', notifications: true, jet: true, petScale: 'auto' };
-function settingsPath() {
-  return path.join(app.getPath('userData'), 'settings.json');
-}
-function loadSettings() {
-  try { Object.assign(settings, JSON.parse(fs.readFileSync(settingsPath(), 'utf8'))); } catch {}
-}
-function saveSettings() {
-  try { fs.writeFileSync(settingsPath(), JSON.stringify(settings)); } catch {}
-}
-function applySettings() {
-  if (win && !win.isDestroyed()) win.webContents.send('settings', settings);
-  refreshTray();
-}
-function setSetting(k, v) {
-  settings[k] = v;
-  saveSettings();
-  applySettings();
+const APP_ID = 'com.matheus.clawdpace';
+const APP_NAME = 'Clawd Pace';
+const FEED_DIR = path.join(os.homedir(), '.claude', 'clawd-pace');
+const FEED_FILE = path.join(FEED_DIR, 'feed.json');
+
+const POLL_MS = 5 * 60e3; // background refresh of plan limits
+const ACTIVITY_GAP_MS = 90e3; // min gap between refreshes triggered by Claude Code activity
+const SCAN_MS = 2 * 60e3; // local log scan
+const WORKING_MS = 120e3; // "Claude is working" if logs changed this recently
+const AWAY_S = 600; // OS idle seconds -> Clawd naps
+
+const PET_W = 180;
+const PET_H = 150;
+const SNAP = process.env.CLAWD_SNAP || ''; // dev only: write PNG captures of the windows to this folder
+const TEST = !!process.env.CLAWD_TEST; // dev only: Clawd stands still + logs input events
+const dlog = (m) => { if (SNAP) try { fs.appendFileSync(path.join(SNAP, 'events.log'), `${new Date().toISOString()} ${m}
+`); } catch { /* ignore */ } };
+
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.setAppUserModelId(APP_ID);
+  start();
 }
 
-// ---------------- virtual pet (Tamagotchi: hunger / energy / sleep) ----------------
-const petPath = () => path.join(app.getPath('userData'), 'petstate.json');
-const petStats = { hunger: 10, energy: 90, sleeping: false, last: Date.now() };
-let petState = 'active'; // sleeping | hungry | lazy | active
-let petSaveAt = 0;
+function start() {
+  const dataDir = app.getPath('userData');
+  const file = (n) => path.join(dataDir, n);
 
-function computePetState() {
-  petState = petStats.sleeping ? 'sleeping'
-    : petStats.hunger >= 70 ? 'hungry'
-    : petStats.energy < 35 ? 'lazy' : 'active';
-}
-function advancePet() {
-  const now = Date.now();
-  let mins = (now - (petStats.last || now)) / 60000;
-  petStats.last = now;
-  if (mins < 0) mins = 0;
-  if (mins > 720) mins = 720; // cap catch-up after being closed (12h)
-  petStats.hunger = Math.min(100, petStats.hunger + mins * 0.33); // full→starving ~5h
-  if (petStats.sleeping) {
-    petStats.energy = Math.min(100, petStats.energy + mins * 1.2); // recovers while asleep
-    if (petStats.energy >= 85) petStats.sleeping = false;
-  } else {
-    petStats.energy = Math.max(0, petStats.energy - mins * (0.45 + (petStats.hunger > 70 ? 0.3 : 0)));
-    if (petStats.energy <= 18) petStats.sleeping = true; // gets sleepy
+  // ---------------- settings ----------------
+  const settings = { walk: true, hud: 'always', size: 'm', notify: true, autostart: true, installed: false, pos: null };
+  try { Object.assign(settings, JSON.parse(fs.readFileSync(file('settings.json'), 'utf8'))); } catch { /* defaults */ }
+  const saveSettings = () => { try { fs.writeFileSync(file('settings.json'), JSON.stringify(settings, null, 1)); } catch { /* ignore */ } };
+
+  // ---------------- state ----------------
+  let plan = null; // last good plan limits
+  let planErr = null;
+  let lastFetch = 0;
+  let notified = {}; // which alerts already fired (per window)
+  try {
+    const last = JSON.parse(fs.readFileSync(file('last.json'), 'utf8'));
+    plan = last.plan || null;
+    notified = last.notified || {};
+  } catch { /* first run */ }
+  const saveLast = () => { try { fs.writeFileSync(file('last.json'), JSON.stringify({ plan, notified })); } catch { /* ignore */ } };
+
+  const history = createHistory(file('history.json'));
+  let usage = null;
+  let lastActivityTs = 0;
+  let pace = computePace(plan, history.all());
+
+  let win = null;
+  let panel = null;
+  let panelClosedAt = 0;
+  let tray = null;
+
+  // ---------------- formatting (pt-BR) ----------------
+  const DOW = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb'];
+  const hhmm = (d) => `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  function when(ms) {
+    if (!ms) return '';
+    const d = new Date(ms);
+    const now = new Date();
+    if (d.toDateString() === now.toDateString()) return hhmm(d);
+    const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+    if (d.toDateString() === tomorrow.toDateString()) return `amanhã ${hhmm(d)}`;
+    return `${DOW[d.getDay()]} ${hhmm(d)}`;
   }
-  computePetState();
-}
-function loadPet() {
-  try { Object.assign(petStats, JSON.parse(fs.readFileSync(petPath(), 'utf8'))); } catch {}
-  advancePet();
-}
-function savePet() { try { fs.writeFileSync(petPath(), JSON.stringify(petStats)); } catch {} petSaveAt = Date.now(); }
-function pushPet() {
-  advancePet();
-  if (win && !win.isDestroyed()) win.webContents.send('pet', { ...petStats, state: petState });
-  if (Date.now() - petSaveAt > 120000) savePet(); // persist ~every 2 min
-  if (tray) refreshTray();
-}
-function feedPet() {
-  advancePet();
-  petStats.hunger = Math.max(0, petStats.hunger - 55);
-  petStats.energy = Math.min(100, petStats.energy + 12);
-  petStats.sleeping = false;
-  computePetState();
-  savePet();
-  if (win && !win.isDestroyed()) {
-    win.webContents.send('eat'); // trigger the eating animation
-    win.webContents.send('pet', { ...petStats, state: petState });
+  function dur(ms) {
+    const m = Math.max(0, Math.round(ms / 60e3));
+    if (m < 60) return `${m} min`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h${String(m % 60).padStart(2, '0')}`;
+    return `${Math.floor(h / 24)}d ${h % 24}h`;
   }
-  gameState.feeds = (gameState.feeds || 0) + 1;
-  markQuest('feed');
-  saveGame();
-  pushGame();
-  refreshTray();
-}
+  const pct = (v) => `${Math.round(v)}%`;
 
-// ---------------- gamification (level / XP / streak / achievements / coins) ----------------
-const gamePath = () => path.join(app.getPath('userData'), 'gamestate.json');
-const gameState = { coins: 0, feeds: 0, unlocked: [], questDay: '', questDone: false, rodeJet: false, rodeBike: false };
-let lastUsageData = null;
-function loadGame() { try { Object.assign(gameState, JSON.parse(fs.readFileSync(gamePath(), 'utf8'))); } catch {} }
-function saveGame() { try { fs.writeFileSync(gamePath(), JSON.stringify(gameState)); } catch {} }
-function todayKey() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-function markQuest(kind) {
-  const q = game.questForDay(todayKey());
-  if (gameState.questDay === todayKey() && gameState.questDone) return;
-  if (gameState.questDay !== todayKey()) { gameState.questDay = todayKey(); gameState.questDone = false; }
-  // 'code' auto-completes from usage; feed/play from events
-  if (q.id === kind || (q.id === 'code' && kind === 'usage')) {
-    if (!gameState.questDone) { gameState.questDone = true; gameState.coins += 30; notify('🎯 Quest complete!', '+30 coins'); }
+  // One short line for hover + tray: the most useful thing to know right now.
+  function headline(p) {
+    if (!p) return '';
+    const s = p.session;
+    const w = p.week;
+    if (s.state === 'maxed') return `Sessão esgotada · volta ${when(s.resetsAt)}`;
+    if (w.state === 'maxed') return `Semana esgotada · volta ${when(w.resetsAt)}`;
+    if (s.state === 'over' && s.etaFull) return `5h acaba ~${when(s.etaFull)} (reset ${when(s.resetsAt)})`;
+    if (w.state === 'over' && w.etaFull) return `Semana acaba ~${when(w.etaFull)} · use ~${Math.round(w.budget)}%/dia`;
+    if (s.state === 'fresh') return `Sessão livre · semana ~${Math.round(w.budget)}%/dia`;
+    return `5h reseta ${when(s.resetsAt)} · semana ~${Math.round(w.budget)}%/dia`;
   }
-}
-function buildGameCtx() {
-  const u = lastUsageData || {};
-  const xpBase = {
-    grand: u.grand || 0,
-    feeds: gameState.feeds,
-    bestStreak: (u.streak && u.streak.best) || 0,
-    unlocked: gameState.unlocked.length,
-  };
-  const xp = game.computeXp(xpBase);
-  const lv = game.levelFromXp(xp);
-  const ctx = {
-    grand: u.grand || 0, feeds: gameState.feeds,
-    bestStreak: (u.streak && u.streak.best) || 0,
-    models: (u.models || []).length, sessions: (u.stats && u.stats.sessions) || 0,
-    activeDays: (u.stats && u.stats.activeDays) || 0,
-    level: lv.level, rodeJet: gameState.rodeJet, rodeBike: gameState.rodeBike,
-  };
-  return { xp, lv, ctx };
-}
-let lastLevel = 0;
-function pushGame() {
-  const { xp, lv, ctx } = buildGameCtx();
-  // newly unlocked achievements -> coins + notify
-  const achs = game.evalAchievements(ctx);
-  for (const a of achs) {
-    if (a.unlocked && !gameState.unlocked.includes(a.id)) {
-      gameState.unlocked.push(a.id);
-      gameState.coins += 25;
-      notify(`${a.emoji} Achievement: ${a.name}`, '+25 coins');
+
+  // ---------------- behaviour (what Clawd is doing) ----------------
+  function behavior() {
+    let idle = 0;
+    try { idle = powerMonitor.getSystemIdleTime(); } catch { /* ignore */ }
+    if (idle > AWAY_S) return 'sleep';
+    if (pace.mood === 'maxed') return 'ko';
+    if (pace.mood === 'over') return 'anxious';
+    if (Date.now() - lastActivityTs < WORKING_MS) return 'busy';
+    return 'calm';
+  }
+
+  const stale = () => !plan || Date.now() - (plan.fetchedAt || 0) > 20 * 60e3;
+
+  function petState() {
+    const view = (x) => ({ state: x.state, util: x.util, expected: x.expected });
+    return {
+      hasData: !!plan,
+      session: view(pace.session),
+      week: view(pace.week),
+      mood: pace.mood,
+      behavior: behavior(),
+      headline: plan ? headline(pace) : planErr === 'no-token' ? 'Faça login no Claude Code' : 'Carregando…',
+      err: planErr,
+      stale: stale(),
+      hud: settings.hud,
+      size: settings.size,
+    };
+  }
+
+  function panelState() {
+    const sr = pace.session.resetsAt;
+    const wr = pace.week.resetsAt;
+    const all = history.all();
+    return {
+      plan,
+      pace,
+      planErr,
+      stale: stale(),
+      lastFetch,
+      usage,
+      working: Date.now() - lastActivityTs < WORKING_MS,
+      headline: headline(pace),
+      sessionSeries: sr ? all.filter((p) => p.sr && Math.abs(p.sr - sr) < 5 * 60e3).map((p) => [p.t, p.s]) : [],
+      weekSeries: wr ? all.filter((p) => p.wr && Math.abs(p.wr - wr) < 5 * 60e3).map((p) => [p.t, p.w]) : [],
+      labels: {
+        sessionReset: sr ? when(sr) : null,
+        sessionLeft: sr ? dur(sr - Date.now()) : null,
+        sessionEta: pace.session.etaFull ? when(pace.session.etaFull) : null,
+        sessionEtaGap: pace.session.etaFull ? dur(sr - pace.session.etaFull) : null,
+        weekReset: wr ? when(wr) : null,
+        weekLeft: wr ? dur(wr - Date.now()) : null,
+        weekEta: pace.week.etaFull ? when(pace.week.etaFull) : null,
+        weekEtaGap: pace.week.etaFull ? dur(wr - pace.week.etaFull) : null,
+      },
+    };
+  }
+
+  let lastPetJson = '';
+  function pushState(force) {
+    pace = computePace(plan, history.all());
+    const ps = petState();
+    const j = JSON.stringify(ps);
+    if (win && !win.isDestroyed() && (force || j !== lastPetJson)) win.webContents.send('pet-state', ps);
+    lastPetJson = j;
+    if (panel && !panel.isDestroyed()) panel.webContents.send('panel-state', panelState());
+    refreshTray();
+    checkAlerts();
+  }
+
+  // ---------------- alerts ----------------
+  function notify(title, body) {
+    if (!settings.notify || !Notification.isSupported()) return;
+    try { new Notification({ title, body, icon: path.join(__dirname, 'build', 'icon.png'), silent: false }).show(); } catch { /* ignore */ }
+  }
+  function petEvent(type) {
+    if (win && !win.isDestroyed()) win.webContents.send('pet-event', type);
+  }
+  let prevSession = null; // { resetsAt, util } to detect resets by time
+  function checkAlerts() {
+    if (!plan) return;
+    const s = pace.session;
+    const w = pace.week;
+    let dirty = false;
+    const once = (key, id, fn) => { if (notified[key] !== id) { notified[key] = id; dirty = true; fn(); } };
+
+    if (s.state === 'over' && s.etaFull) once('sessOver', s.resetsAt, () => notify('Ritmo alto na sessão de 5h', `No ritmo atual o limite acaba ~${when(s.etaFull)} — o reset é só às ${when(s.resetsAt)}.`));
+    if (s.util >= 90 && s.resetsAt) once('sess90', s.resetsAt, () => notify(`Sessão em ${pct(s.util)}`, `Reset às ${when(s.resetsAt)} (${dur(s.resetsAt - Date.now())}).`));
+    const today = new Date().toDateString();
+    if (w.state === 'over' && w.etaFull) once('weekOver', today, () => notify('Semana acima do ritmo', `No ritmo atual você bate 100% ${when(w.etaFull)}, antes do reset (${when(w.resetsAt)}). Pra durar: ~${Math.round(w.budget)}%/dia.`));
+    if (w.util >= 90 && w.resetsAt) once('week90', w.resetsAt, () => notify(`Semana em ${pct(w.util)}`, `Reset ${when(w.resetsAt)}.`));
+
+    // Session reset (detected by time, no fetch needed) -> celebrate.
+    if (prevSession && prevSession.resetsAt && Date.now() >= prevSession.resetsAt && prevSession.util >= 25) {
+      once('sessReset', prevSession.resetsAt, () => {
+        notify('Sessão renovada', '100% da sessão de 5h disponível de novo.');
+        petEvent('celebrate');
+      });
+    }
+    prevSession = s.resetsAt ? { resetsAt: s.resetsAt, util: s.util } : prevSession && Date.now() < prevSession.resetsAt ? prevSession : null;
+    if (dirty) saveLast();
+  }
+
+  // ---------------- plan limits: API + statusline feed ----------------
+  let inflight = false;
+  let backoffMs = 0;
+  let backoffUntil = 0;
+  let activityTimer = null;
+
+  function applyPlan(p) {
+    plan = p;
+    history.add(plan);
+    history.save();
+    saveLast();
+    pushState();
+  }
+
+  async function refreshLimits(reason) {
+    if (inflight) return;
+    if (reason !== 'manual' && Date.now() < backoffUntil) return;
+    inflight = true;
+    let r;
+    try { r = await fetchLimits(); } finally { inflight = false; }
+    lastFetch = Date.now();
+    if (r.ok) {
+      planErr = null;
+      backoffMs = 0;
+      applyPlan(r.plan);
+    } else {
+      planErr = r.error;
+      if (r.error === 'http-429') {
+        backoffMs = Math.min(Math.max(backoffMs * 2, 5 * 60e3), 30 * 60e3);
+        backoffUntil = Date.now() + backoffMs;
+      }
+      pushState();
     }
   }
-  // level-up -> coins
-  if (lastLevel && lv.level > lastLevel) { gameState.coins += 50 * (lv.level - lastLevel); notify('⭐ Level up!', `Clawd reached Lv.${lv.level} · +${50 * (lv.level - lastLevel)} coins`); }
-  lastLevel = lv.level;
-  // daily 'code' quest from real usage
-  if (lastUsageData && lastUsageData.todayGrand > 0) markQuest('usage');
-  saveGame();
-  const q = game.questForDay(todayKey());
-  if (win && !win.isDestroyed()) {
-    win.webContents.send('game', {
-      level: lv.level, into: lv.into, need: lv.need, xp,
-      coins: gameState.coins,
-      streak: lastUsageData ? lastUsageData.streak : { current: 0, best: 0 },
-      achievements: achs,
-      quest: { text: q.text, done: gameState.questDay === todayKey() && gameState.questDone },
-      shop: game.SHOP,
+
+  function scheduleActivityRefresh() {
+    if (activityTimer) return;
+    const wait = Math.max(4000, lastFetch + ACTIVITY_GAP_MS - Date.now());
+    activityTimer = setTimeout(() => { activityTimer = null; refreshLimits('activity'); }, wait);
+  }
+
+  function readFeed() {
+    try {
+      const f = JSON.parse(fs.readFileSync(FEED_FILE, 'utf8'));
+      if (!f || !f.ts || Date.now() - f.ts > 10 * 60e3) return;
+      if (plan && plan.fetchedAt >= f.ts) return;
+      applyPlan({ ...(plan || {}), session: f.session || (plan && plan.session), week: f.week || (plan && plan.week), fetchedAt: f.ts, source: 'statusline' });
+    } catch { /* ignore */ }
+  }
+
+  // ---------------- local logs (worker thread) ----------------
+  let worker = null;
+  let scanBusy = false;
+  let scanTimer = null;
+  function startWorker() {
+    worker = new Worker(path.join(__dirname, 'usage-worker.js'), { workerData: { cacheFile: file('usage-cache.json') } });
+    worker.on('message', (m) => {
+      scanBusy = false;
+      if (m && m.ok) {
+        usage = m.data;
+        if (usage.lastActivity > lastActivityTs && Date.now() - usage.lastActivity < WORKING_MS) lastActivityTs = usage.lastActivity;
+        if (panel && !panel.isDestroyed()) panel.webContents.send('panel-state', panelState());
+      }
     });
+    worker.on('error', (e) => { scanBusy = false; console.error('usage worker', e); });
+    worker.on('exit', () => { worker = null; scanBusy = false; });
   }
-}
-function buyItem(id) {
-  const item = game.SHOP.find((s) => s.id === id);
-  if (!item || gameState.coins < item.cost) return;
-  gameState.coins -= item.cost;
-  advancePet();
-  petStats.hunger = Math.max(0, Math.min(100, petStats.hunger + item.hunger));
-  petStats.energy = Math.max(0, Math.min(100, petStats.energy + item.energy));
-  petStats.sleeping = false;
-  computePetState();
-  savePet(); saveGame();
-  if (win && !win.isDestroyed()) { win.webContents.send('eat'); win.webContents.send('pet', { ...petStats, state: petState }); }
-  pushGame(); refreshTray();
-}
+  function scan() {
+    if (!worker) startWorker();
+    if (scanBusy) return;
+    scanBusy = true;
+    worker.postMessage('scan');
+  }
+  function scheduleScan() {
+    if (scanTimer) return;
+    scanTimer = setTimeout(() => { scanTimer = null; scan(); }, 45e3);
+  }
 
-// ---------------- threshold notifications ----------------
-const notifyState = { session: {}, week: {} };
-function notify(title, body) {
-  try { new Notification({ title, body }).show(); } catch {}
-}
-function checkNotify(plan) {
-  if (!settings.notifications || !plan) return;
-  for (const [key, label] of [['session', 'Session'], ['week', 'Weekly']]) {
-    const info = plan[key];
-    if (!info) continue;
-    const st = notifyState[key];
-    if (info.resetsAt && st.lastReset && info.resetsAt !== st.lastReset) {
-      st.at80 = st.at90 = false;
-      notify(`✓ ${label} limit reset`, 'Fresh 100% available 🎉');
+  function onActivity() {
+    const was = behavior();
+    lastActivityTs = Date.now();
+    if (behavior() !== was) pushState();
+    scheduleActivityRefresh();
+    scheduleScan();
+  }
+
+  function watchSources() {
+    try {
+      fs.watch(PROJECTS_DIR, { recursive: true }, (_ev, name) => { if (name && String(name).endsWith('.jsonl')) onActivity(); });
+    } catch (e) { console.error('watch projects', e.message); }
+    try {
+      fs.mkdirSync(FEED_DIR, { recursive: true });
+      fs.watch(FEED_DIR, (_ev, name) => { if (name === 'feed.json') readFeed(); });
+    } catch (e) { console.error('watch feed', e.message); }
+    let credTimer = null;
+    try {
+      fs.watch(path.dirname(CRED_FILES[0]), (_ev, name) => {
+        if (name !== path.basename(CRED_FILES[0]) || credTimer) return;
+        // Claude Code refreshed its token -> retry right away if we were stuck.
+        credTimer = setTimeout(() => { credTimer = null; if (planErr) refreshLimits('creds'); }, 2500);
+      });
+    } catch (e) { console.error('watch creds', e.message); }
+  }
+
+  // ---------------- pet window ----------------
+  function workAreaFor(b) {
+    return screen.getDisplayMatching(b).workArea;
+  }
+  function groundY(area) {
+    return area.y + area.height - PET_H;
+  }
+
+  function createPet() {
+    win = new BrowserWindow({
+      width: PET_W,
+      height: PET_H,
+      frame: false,
+      transparent: true,
+      backgroundColor: '#00000000',
+      hasShadow: false,
+      resizable: false,
+      maximizable: false,
+      minimizable: false,
+      fullscreenable: false,
+      skipTaskbar: true,
+      alwaysOnTop: true,
+      focusable: false,
+      show: false,
+      title: APP_NAME,
+      webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
+    });
+    lockDown(win);
+    win.setAlwaysOnTop(true, 'screen-saver');
+    win.setIgnoreMouseEvents(true, { forward: true });
+
+    const area = screen.getPrimaryDisplay().workArea;
+    let x = area.x + area.width - PET_W - 160;
+    let y = groundY(area);
+    if (!settings.walk && settings.pos) {
+      const ok = screen.getAllDisplays().some((d) => {
+        const a = d.workArea;
+        return settings.pos.x >= a.x - 20 && settings.pos.x <= a.x + a.width && settings.pos.y >= a.y - 40 && settings.pos.y <= a.y + a.height;
+      });
+      if (ok) ({ x, y } = settings.pos);
     }
-    st.lastReset = info.resetsAt;
-    const u = info.util;
-    if (u < 70) { st.at80 = st.at90 = false; } // rearm after it drops
-    else if (u >= 90 && !st.at90) { st.at90 = true; notify(`⚠️ ${label} ${Math.round(u)}% used`, `Only ${Math.round(100 - u)}% left — slow down!`); }
-    else if (u >= 80 && !st.at80) { st.at80 = true; notify(`${label} 80% used`, `${Math.round(100 - u)}% left this ${key === 'session' ? 'session' : 'week'}`); }
-  }
-}
-
-// The window reserves bubble room above AND below the mascot so the bubble can
-// flip to whichever side stays on screen. These must match the CSS variables.
-const WIN_W = 300;
-const BUBBLE_SPACE = 410; // tall enough for the Awards tab (must match CSS --bubble-space)
-const PET_BOX = 132; // >= sprite frame height (114); the mascot is scaled smaller via CSS
-const WIN_H = BUBBLE_SPACE + PET_BOX + BUBBLE_SPACE; // 772
-const PET_FEET = BUBBLE_SPACE + PET_BOX; // mascot's feet, measured from window top
-const REFRESH_MS = 60 * 1000;
-
-let win = null;
-let tray = null;
-let paused = false; // stats bubble open
-let dragging = false; // user is dragging the pet
-let jetMode = false; // jet fly-across in progress
-let groundTop = 0; // window-top the pet roams along (updated when dropped)
-let jetTimer = null;
-
-function floorTop(area) {
-  return area.y + area.height - PET_FEET;
-}
-
-function createWindow() {
-  win = new BrowserWindow({
-    width: WIN_W,
-    height: WIN_H,
-    frame: false,
-    transparent: true,
-    hasShadow: false,
-    resizable: false,
-    movable: true,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    fullscreenable: false,
-    focusable: true,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
-  });
-
-  const debug = !!process.env.PET_DEBUG;
-  if (debug) {
-    win.webContents.on('console-message', (_e, _l, m) => console.log('[renderer]', m));
-  }
-
-  // 'screen-saver' level is macOS-specific; plain alwaysOnTop elsewhere.
-  if (process.platform === 'darwin') win.setAlwaysOnTop(true, 'screen-saver');
-  else win.setAlwaysOnTop(true);
-  if (process.platform !== 'win32') {
-    win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-  }
-  win.loadFile(path.join(__dirname, 'renderer', 'index.html'), {
-    search: debug ? 'debug=1' : '',
-  });
-
-  const area = screen.getPrimaryDisplay().workArea;
-  groundTop = floorTop(area);
-
-  if (debug) {
-    win.setBounds({ x: area.x + 420, y: area.y + 40, width: WIN_W, height: WIN_H });
-    paused = true;
+    walker.x = x;
+    win.setBounds({ x, y, width: PET_W, height: PET_H });
+    win.loadFile(path.join(__dirname, 'renderer', 'pet.html'));
     win.webContents.once('did-finish-load', () => {
-      pushUsage();
-      sendPlacement();
+      win.showInactive();
+      pushState(true);
     });
-    return;
   }
 
-  win.setIgnoreMouseEvents(true, { forward: true });
-  win.setBounds({ x: area.x + 60, y: groundTop, width: WIN_W, height: WIN_H });
-  win.webContents.once('did-finish-load', () => sendPlacement());
-
-  startRoaming();
-  pushUsage();
-  scheduleStunt();
-}
-
-// Should the bubble open above or below the pet, given the window's position?
-function placement() {
-  const b = win.getBounds();
-  const area = screen.getDisplayMatching(b).workArea;
-  const petTopScreen = b.y + BUBBLE_SPACE;
-  return petTopScreen - area.y < BUBBLE_SPACE - 20 ? 'below' : 'above';
-}
-function sendPlacement() {
-  if (win && !win.isDestroyed()) win.webContents.send('place', placement());
-}
-
-function startRoaming() {
-  let dir = 1;
-  let mode = 'walk';
-  let timer = 0;
-  const SPEED = 0.9;
-
-  function reschedule() {
-    const slow = petState === 'lazy' || petState === 'hungry';
-    timer =
-      mode === 'walk'
-        ? Math.round((90 + Math.random() * 160) * (slow ? 0.5 : 1))
-        : Math.round((60 + Math.random() * 110) * (slow ? 2 : 1));
+  function lockDown(w) {
+    w.webContents.on('will-navigate', (e) => e.preventDefault());
+    w.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   }
-  reschedule();
 
-  setInterval(() => {
-    if (!win || win.isDestroyed() || paused || dragging || jetMode) return;
-    const area = screen.getDisplayMatching(win.getBounds()).workArea;
-    const minX = area.x;
-    const maxX = area.x + area.width - WIN_W;
+  // ---- walking ----
+  const walker = { mode: 'rest', until: Date.now() + 2500, dir: -1, x: 0, lastSent: null, lastTick: Date.now() };
+  const drag = { active: false, off: { x: 0, y: 0 }, start: { x: 0, y: 0 }, timer: null };
+  const fall = { active: false, y: 0, vy: 0 };
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const SPEED = { calm: 28, busy: 40, anxious: 56 }; // px/s
+  const STEP = 4; // move in whole 4px hops: pixel-art feel and ~3x fewer window moves (CPU)
+  const REST = { calm: [6000, 16000], busy: [3000, 8000], anxious: [1800, 4500] };
+  const WALK = { calm: [2500, 5000], busy: [2500, 5500], anxious: [1500, 3200] };
+
+  function sendWalk(dir, speed) {
+    const key = dir + ':' + speed;
+    if (walker.lastSent === key) return;
+    walker.lastSent = key;
+    if (win && !win.isDestroyed()) win.webContents.send('walk', { dir, speed });
+  }
+
+  function tick() {
+    const now = Date.now();
+    const dt = Math.min(0.1, (now - walker.lastTick) / 1000);
+    walker.lastTick = now;
+    if (!win || win.isDestroyed() || !win.isVisible() || drag.active) return;
     const b = win.getBounds();
+    const area = workAreaFor(b);
 
-    // asleep -> stay curled up on the ground
-    if (petState === 'sleeping') {
-      win.webContents.send('walk', 0);
-      if (b.y !== groundTop) win.setBounds({ x: b.x, y: groundTop, width: WIN_W, height: WIN_H });
-      return;
-    }
-    const slow = petState === 'lazy' || petState === 'hungry';
-
-    if (mode === 'rest') {
-      win.webContents.send('walk', 0);
-      if (b.y !== groundTop) win.setBounds({ x: b.x, y: groundTop, width: WIN_W, height: WIN_H });
-      if (--timer <= 0) {
-        mode = 'walk';
-        if (Math.random() < 0.5) dir = -dir;
-        reschedule();
+    if (fall.active) {
+      fall.vy = Math.min(fall.vy + 2600 * dt, 2200);
+      fall.y += fall.vy * dt;
+      const gy = groundY(area);
+      if (fall.y >= gy) {
+        fall.active = false;
+        win.setBounds({ x: b.x, y: gy, width: PET_W, height: PET_H });
+        petEvent('land');
+        dlog('land y=' + gy);
+      } else {
+        win.setBounds({ x: b.x, y: Math.round(fall.y), width: PET_W, height: PET_H });
       }
       return;
     }
 
-    let nx = b.x + dir * SPEED * (slow ? 0.5 : 1);
-    if (nx <= minX) { nx = minX; dir = 1; }
-    else if (nx >= maxX) { nx = maxX; dir = -1; }
-    win.setBounds({ x: Math.round(nx), y: groundTop, width: WIN_W, height: WIN_H });
-    win.webContents.send('walk', dir);
-    if (--timer <= 0) { mode = 'rest'; reschedule(); }
-  }, 30);
-}
+    const beh = behavior();
+    if (TEST) return sendWalk(0, 0);
+    if (!settings.walk || panel || beh === 'sleep' || beh === 'ko') return sendWalk(0, 0);
 
-// ---------------- drag: window follows the cursor ----------------
-let dragOffset = { x: 0, y: 0 };
-let dragStartPos = { x: 0, y: 0 };
-let dragInterval = null;
-
-function startDrag() {
-  if (jetMode) return;
-  dragging = true;
-  const c = screen.getCursorScreenPoint();
-  const b = win.getBounds();
-  dragStartPos = { x: b.x, y: b.y };
-  dragOffset = { x: c.x - b.x, y: c.y - b.y };
-  dragInterval = setInterval(() => {
-    if (!win || win.isDestroyed()) return;
-    const p = screen.getCursorScreenPoint();
-    win.setBounds({ x: p.x - dragOffset.x, y: p.y - dragOffset.y, width: WIN_W, height: WIN_H });
-  }, 12);
-}
-function endDrag() {
-  dragging = false;
-  if (dragInterval) clearInterval(dragInterval);
-  dragInterval = null;
-  const b = win.getBounds();
-  const moved = Math.abs(b.x - dragStartPos.x) + Math.abs(b.y - dragStartPos.y);
-  groundTop = b.y; // roam along wherever it was dropped
-  sendPlacement();
-  // A press that barely moved is a tap -> toggle the bubble (decided here in
-  // main from the real window movement, which is more reliable than DOM deltas).
-  if (moved < 6) win.webContents.send('tap');
-}
-
-// ---------------- cross-screen stunts: jet ✈️ / bike 🚲 / run 🏃 ----------------
-function scheduleStunt() {
-  if (jetTimer) clearTimeout(jetTimer);
-  jetTimer = setTimeout(() => {
-    const opts = ['bike', 'run'];
-    if (settings.jet) opts.push('jet');
-    crossScreen(opts[Math.floor(Math.random() * opts.length)]);
-  }, 75000 + Math.random() * 90000); // every ~1.25–2.75 min
-}
-function crossScreen(kind) {
-  if (!win || win.isDestroyed() || paused || dragging || jetMode) return scheduleStunt();
-  if (kind === 'jet' && !settings.jet) return scheduleStunt();
-  jetMode = true; // pauses roaming during any stunt
-  if (kind === 'jet') gameState.rodeJet = true;
-  if (kind === 'bike') gameState.rodeBike = true;
-  const area = screen.getDisplayMatching(win.getBounds()).workArea;
-  const dir = Math.random() < 0.5 ? 1 : -1;
-  const topY = kind === 'jet' ? area.y - 280 : groundTop; // jet flies up high; bike/run on the ground
-  const off = WIN_W + 40;
-  let x = dir === 1 ? area.x - off : area.x + area.width + off - WIN_W;
-  const endX = dir === 1 ? area.x + area.width + off - WIN_W : area.x - off;
-  const steps = kind === 'run' ? 75 : kind === 'bike' ? 120 : 110;
-  const dx = (endX - x) / steps;
-
-  win.setBounds({ x: Math.round(x), y: topY, width: WIN_W, height: WIN_H });
-  win.webContents.send(kind + '-start', dir);
-
-  let i = 0;
-  const fly = setInterval(() => {
-    i++;
-    x += dx;
-    win.setBounds({ x: Math.round(x), y: topY, width: WIN_W, height: WIN_H });
-    if (i >= steps) {
-      clearInterval(fly);
-      jetMode = false;
-      const a = screen.getDisplayMatching(win.getBounds()).workArea;
-      const cx = Math.min(Math.max(area.x + area.width / 2 - WIN_W / 2, a.x), a.x + a.width - WIN_W);
-      groundTop = floorTop(a);
-      win.setBounds({ x: Math.round(cx), y: groundTop, width: WIN_W, height: WIN_H });
-      win.webContents.send(kind + '-end');
-      sendPlacement();
-      pushGame(); // rode-jet/bike may unlock achievements
-      scheduleStunt();
+    if (now > walker.until) {
+      if (walker.mode === 'walk') {
+        walker.mode = 'rest';
+        walker.until = now + rand(...REST[beh]);
+      } else {
+        walker.mode = 'walk';
+        walker.until = now + rand(...WALK[beh]);
+        if (Math.random() < 0.5) walker.dir *= -1;
+      }
     }
-  }, 15);
-}
+    if (walker.mode === 'rest') return sendWalk(0, 0);
 
-// ---------------- usage + menu bar ----------------
-function fmtTokens(n) {
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
-  return String(n || 0);
-}
-function pushUsage() {
-  try {
-    const data = collectUsage();
-    lastUsageData = data;
-    if (win && !win.isDestroyed()) win.webContents.send('usage', data);
-    trayToday = data.todayGrand;
-    refreshTray();
-    pushGame();
-  } catch (e) {
-    console.error('usage scan failed:', e);
+    const speed = SPEED[beh];
+    if (Math.abs(walker.x - b.x) > 3) walker.x = b.x; // moved externally
+    walker.x += walker.dir * speed * dt;
+    const minX = area.x - 30;
+    const maxX = area.x + area.width - PET_W + 30;
+    if (walker.x <= minX) { walker.x = minX; walker.dir = 1; }
+    if (walker.x >= maxX) { walker.x = maxX; walker.dir = -1; }
+    const gy = groundY(area);
+    const nx = Math.round(walker.x / STEP) * STEP;
+    if (nx !== b.x || b.y !== gy) win.setBounds({ x: nx, y: gy, width: PET_W, height: PET_H }); // setBounds: setPosition can drift size on mixed-DPI setups
+    sendWalk(walker.dir, speed);
   }
-}
 
-// Real plan limits from the oauth usage endpoint (session % + weekly %).
-let limitsTimer = null;
-let limitsBackoff = 0; // minutes, grows on 429 so we don't hammer the endpoint
-async function pushLimits() {
-  let r;
-  try {
-    r = await fetchLimits();
-    if (win && !win.isDestroyed()) win.webContents.send('plan', r);
-    if (r && r.ok) { trayPlan = r.plan; checkNotify(trayPlan); limitsBackoff = 0; } // keep last good plan
-    else if (r && /429/.test(r.error || '')) { limitsBackoff = Math.min(limitsBackoff ? limitsBackoff * 2 : 5, 30); }
-    refreshTray();
-  } catch (e) {
-    console.error('limits fetch failed:', e);
+  function startDrag() {
+    if (!win || drag.active) return;
+    dlog('drag-start');
+    fall.active = false;
+    drag.active = true;
+    const c = screen.getCursorScreenPoint();
+    const b = win.getBounds();
+    drag.start = { x: b.x, y: b.y };
+    drag.off = { x: c.x - b.x, y: c.y - b.y };
+    sendWalk(0, 0);
+    petEvent('drag-start');
+    drag.timer = setInterval(() => {
+      if (!win || win.isDestroyed()) return;
+      const p = screen.getCursorScreenPoint();
+      win.setBounds({ x: p.x - drag.off.x, y: p.y - drag.off.y, width: PET_W, height: PET_H });
+    }, 12);
   }
-  return r;
-}
-// Self-scheduling poll: ~3 min normally, exponential backoff (up to 30 min) on 429.
-function scheduleLimits() {
-  if (limitsTimer) clearTimeout(limitsTimer);
-  pushLimits().then((r) => {
-    const mins = r && r.ok ? 3 : (limitsBackoff || 5);
-    limitsTimer = setTimeout(scheduleLimits, mins * 60000);
-  });
-}
-
-// ---- menu-bar meter (CodexBar-style: live % + detailed dropdown) ----
-let trayPlan = null;
-let trayToday = 0;
-const pct = (p) => Math.round(p) + '%';
-
-function resetShort(iso) {
-  if (!iso) return '';
-  const t = new Date(iso), diff = t - Date.now();
-  if (diff <= 0) return 'resetting';
-  if (diff < 24 * 3600e3) {
-    const h = Math.floor(diff / 3600e3), m = Math.floor((diff % 3600e3) / 60e3);
-    return h > 0 ? `resets in ${h}h ${m}m` : `resets in ${m}m`;
+  function endDrag() {
+    if (!drag.active) return;
+    drag.active = false;
+    clearInterval(drag.timer);
+    const b = win.getBounds();
+    const moved = Math.abs(b.x - drag.start.x) + Math.abs(b.y - drag.start.y);
+    walker.x = b.x;
+    dlog(`drag-end moved=${moved} at ${b.x},${b.y}`);
+    if (moved < 6) { petEvent('drag-end'); togglePanel(); return; }
+    petEvent('drag-end');
+    if (settings.walk) {
+      // let go mid-air -> falls back to the taskbar
+      fall.active = true;
+      fall.y = b.y;
+      fall.vy = 0;
+      walker.mode = 'rest';
+      walker.until = Date.now() + 1500;
+    } else {
+      settings.pos = { x: b.x, y: b.y };
+      saveSettings();
+    }
   }
-  const d = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-  let hr = t.getHours();
-  const ap = hr >= 12 ? 'PM' : 'AM';
-  hr = hr % 12 || 12;
-  return `resets ${d[t.getDay()]} ${hr}${ap}`;
-}
 
-function refreshTray() {
-  if (!tray) return;
-  const p = trayPlan;
-  const metric = p && (settings.menuBarMetric === 'session' ? p.session : p.week);
-  // Title: chosen plan % (settings), falling back to today's tokens.
-  if (process.platform === 'darwin') {
-    tray.setTitle(metric ? ' ' + pct(metric.util) : ' ' + fmtTokens(trayToday));
+  // ---------------- panel window ----------------
+  function panelAnchor() {
+    if (win && !win.isDestroyed() && win.isVisible()) return win.getBounds();
+    if (tray) { const t = tray.getBounds(); if (t && t.width) return t; }
+    const a = screen.getPrimaryDisplay().workArea;
+    return { x: a.x + a.width - 200, y: a.y + a.height - 10, width: 10, height: 10 };
   }
-  tray.setToolTip(
-    p && p.session && p.week
-      ? `Claude · Session ${pct(p.session.util)} · Weekly ${pct(p.week.util)}` +
-          (p.planName ? ` · ${p.planName}` : '')
-      : 'Claude Usage Pet · ' + fmtTokens(trayToday) + ' today'
-  );
-  tray.setContextMenu(buildTrayMenu());
-}
+  function placePanel(h) {
+    if (!panel || panel.isDestroyed()) return;
+    const W = 360;
+    const anchor = panelAnchor();
+    const area = workAreaFor(anchor);
+    const top = anchor.y + PET_H - 118; // roughly the top of the HUD inside the pet window
+    let x = Math.round(anchor.x + anchor.width / 2 - W / 2);
+    x = Math.max(area.x + 8, Math.min(x, area.x + area.width - W - 8));
+    h = Math.min(h, area.height - 16);
+    let y = top - h - 6;
+    if (y < area.y + 8) y = Math.min(anchor.y + anchor.height + 6, area.y + area.height - h - 8);
+    panel.setBounds({ x, y: Math.max(area.y + 8, y), width: W, height: h });
+  }
+  function togglePanel() {
+    dlog('toggle-panel ' + (panel ? 'close' : 'open'));
+    if (panel && !panel.isDestroyed()) { panel.close(); return; }
+    if (Date.now() - panelClosedAt < 350) return; // the click that blurred it
+    panel = new BrowserWindow({
+      width: 360,
+      height: 560,
+      frame: false,
+      transparent: true,
+      backgroundColor: '#00000000',
+      resizable: false,
+      maximizable: false,
+      minimizable: false,
+      fullscreenable: false,
+      skipTaskbar: true,
+      alwaysOnTop: true,
+      show: false,
+      title: APP_NAME,
+      webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
+    });
+    lockDown(panel);
+    panel.setAlwaysOnTop(true, 'pop-up-menu');
+    placePanel(560);
+    panel.loadFile(path.join(__dirname, 'renderer', 'panel.html'));
+    panel.webContents.once('did-finish-load', () => {
+      panel.webContents.send('panel-state', panelState());
+      setTimeout(() => { if (panel && !panel.isDestroyed()) { panel.show(); panel.focus(); } }, 60); // after first layout
+    });
+    panel.on('blur', () => { if (!SNAP && panel && !panel.isDestroyed()) panel.close(); });
+    panel.on('closed', () => { panel = null; panelClosedAt = Date.now(); pushState(); });
+    sendWalk(0, 0);
+    if (usage == null || Date.now() - usage.updatedAt > 60e3) scan();
+  }
 
-function buildTrayMenu() {
-  const p = trayPlan;
-  const head = [];
-  if (p && p.session && p.week) {
-    if (p.planName) head.push({ label: `Plan · ${p.planName}`, enabled: false });
-    head.push({ label: `Session   ${pct(p.session.util)} used · ${resetShort(p.session.resetsAt)}`, enabled: false });
-    head.push({ label: `Weekly    ${pct(p.week.util)} used · ${resetShort(p.week.resetsAt)}`, enabled: false });
-    if (p.extra) head.push({ label: `Extra     ${pct(p.extra.util || 0)} used`, enabled: false });
-    head.push({ type: 'separator' });
+  // ---------------- tray ----------------
+  function refreshTray() {
+    if (!tray) return;
+    const hasData = !!plan;
+    try {
+      tray.setImage(trayIcon(hasData ? pace.session : null, hasData ? pace.week : null, stale()));
+    } catch (e) { console.error('tray icon', e.message); }
+    const s = pace.session;
+    const w = pace.week;
+    const tip = hasData
+      ? `Clawd Pace\nSessão ${s.state === 'fresh' ? 'livre' : pct(s.util)}${s.resetsAt ? ' · reset ' + when(s.resetsAt) : ''}\nSemana ${pct(w.util)} · reset ${when(w.resetsAt)}\n${headline(pace)}`
+      : 'Clawd Pace · ' + (planErr === 'no-token' ? 'faça login no Claude Code' : 'carregando…');
+    tray.setToolTip(tip.slice(0, 127));
   }
-  const petEmoji = { sleeping: '😴', hungry: '🤤', lazy: '😪', active: '😊' }[petState] || '😊';
-  return Menu.buildFromTemplate([
-    ...head,
-    { label: `🐾 Clawd ${petEmoji}  ·  🍗 ${Math.round(100 - petStats.hunger)}%  ⚡ ${Math.round(petStats.energy)}%`, enabled: false },
-    { label: '🍪 Feed Clawd', click: () => feedPet() },
-    { type: 'separator' },
-    { label: 'Refresh now', click: () => { pushUsage(); pushLimits(); } },
-    { label: 'Take a jet flight ✈️', click: () => crossScreen('jet') },
-    { label: 'Go for a bike ride 🚲', click: () => crossScreen('bike') },
-    {
-      label: 'Settings',
-      submenu: [
-        {
-          label: 'Menu-bar shows',
-          submenu: [
-            { label: 'Weekly %', type: 'radio', checked: settings.menuBarMetric === 'weekly', click: () => setSetting('menuBarMetric', 'weekly') },
-            { label: 'Session %', type: 'radio', checked: settings.menuBarMetric === 'session', click: () => setSetting('menuBarMetric', 'session') },
-          ],
+
+  function buildMenu() {
+    const s = pace.session;
+    const w = pace.week;
+    const head = plan
+      ? [
+          { label: `Sessão  ${s.state === 'fresh' ? 'livre' : pct(s.util)}${s.resetsAt ? '  ·  reset ' + when(s.resetsAt) : ''}`, enabled: false },
+          { label: `Semana  ${pct(w.util)}  ·  reset ${when(w.resetsAt)}`, enabled: false },
+          { type: 'separator' },
+        ]
+      : [];
+    const set = (k, v) => { settings[k] = v; saveSettings(); pushState(true); };
+    return Menu.buildFromTemplate([
+      ...head,
+      { label: 'Abrir painel', click: togglePanel },
+      { label: 'Atualizar agora', click: () => { refreshLimits('manual'); scan(); } },
+      { type: 'separator' },
+      {
+        label: 'Andar pela tela',
+        type: 'checkbox',
+        checked: settings.walk,
+        click: (i) => {
+          set('walk', i.checked);
+          if (i.checked) { const b = win.getBounds(); fall.active = true; fall.y = b.y; fall.vy = 0; }
+          else { const b = win.getBounds(); settings.pos = { x: b.x, y: b.y }; saveSettings(); }
         },
-        {
-          label: 'Pet size',
-          submenu: [
-            { label: 'Auto (by usage)', type: 'radio', checked: settings.petScale === 'auto', click: () => setSetting('petScale', 'auto') },
-            { label: 'Small', type: 'radio', checked: settings.petScale === 'small', click: () => setSetting('petScale', 'small') },
-            { label: 'Large', type: 'radio', checked: settings.petScale === 'large', click: () => setSetting('petScale', 'large') },
-          ],
-        },
-        { label: 'Notifications', type: 'checkbox', checked: settings.notifications, click: (i) => setSetting('notifications', i.checked) },
-        { label: 'Jet flights ✈️', type: 'checkbox', checked: settings.jet, click: (i) => setSetting('jet', i.checked) },
-      ],
-    },
-    {
-      label: 'Reset position',
-      click: () => {
-        const a = screen.getPrimaryDisplay().workArea;
-        groundTop = floorTop(a);
-        win.setBounds({ x: a.x + 60, y: groundTop, width: WIN_W, height: WIN_H });
-        sendPlacement();
       },
-    },
-    { label: 'Show / hide pet', click: () => (win.isVisible() ? win.hide() : win.show()) },
-    {
-      label: 'Open at login',
-      type: 'checkbox',
-      checked: app.getLoginItemSettings().openAtLogin,
-      click: (item) => {
-        app.setLoginItemSettings({ openAtLogin: item.checked });
-        tray.setContextMenu(buildTrayMenu());
+      {
+        label: 'Barras de uso',
+        submenu: [
+          { label: 'Sempre visíveis', type: 'radio', checked: settings.hud === 'always', click: () => set('hud', 'always') },
+          { label: 'Só ao passar o mouse', type: 'radio', checked: settings.hud === 'hover', click: () => set('hud', 'hover') },
+        ],
       },
-    },
-    { type: 'separator' },
-    { label: 'Quit', click: () => app.quit() },
-  ]);
-}
-function createTray() {
-  const iconPath = path.join(__dirname, 'renderer', 'assets', 'tray.png');
-  let img = nativeImage.createFromPath(iconPath);
-  if (img.isEmpty()) img = nativeImage.createEmpty();
-  else img = img.resize({ height: 18 });
-  tray = new Tray(img);
-  if (img.isEmpty()) tray.setTitle('🟫');
-  tray.setToolTip('Claude Usage Pet');
-  tray.setContextMenu(buildTrayMenu());
-}
+      {
+        label: 'Tamanho',
+        submenu: [
+          { label: 'Pequeno', type: 'radio', checked: settings.size === 's', click: () => set('size', 's') },
+          { label: 'Médio', type: 'radio', checked: settings.size === 'm', click: () => set('size', 'm') },
+          { label: 'Grande', type: 'radio', checked: settings.size === 'l', click: () => set('size', 'l') },
+        ],
+      },
+      { label: 'Notificações de ritmo', type: 'checkbox', checked: settings.notify, click: (i) => set('notify', i.checked) },
+      { label: 'Iniciar com o Windows', type: 'checkbox', checked: settings.autostart, click: (i) => { set('autostart', i.checked); syncAutostart(); } },
+      { type: 'separator' },
+      { label: 'Trazer o Clawd pra cá', click: bringBack },
+      { label: win && win.isVisible() ? 'Esconder o Clawd' : 'Mostrar o Clawd', click: () => { if (win.isVisible()) win.hide(); else { win.showInactive(); pushState(true); } } },
+      { type: 'separator' },
+      { label: 'Sair', click: () => app.quit() },
+    ]);
+  }
+  function popMenu() {
+    const m = buildMenu();
+    if (win && !win.isDestroyed() && win.isVisible()) m.popup({ window: win });
+    else if (tray) tray.popUpContextMenu(m);
+  }
+  function bringBack() {
+    const a = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea;
+    walker.x = Math.round(Math.min(Math.max(screen.getCursorScreenPoint().x - PET_W / 2, a.x), a.x + a.width - PET_W));
+    win.setBounds({ x: walker.x, y: groundY(a), width: PET_W, height: PET_H });
+    settings.pos = null;
+    saveSettings();
+    if (!win.isVisible()) win.showInactive();
+    petEvent('celebrate');
+  }
+  function createTray() {
+    tray = new Tray(trayIcon(null, null, true));
+    tray.on('click', togglePanel);
+    tray.on('right-click', () => tray.popUpContextMenu(buildMenu()));
+    refreshTray();
+  }
 
-ipcMain.on('set-paused', (_e, v) => { paused = !!v; });
-ipcMain.on('request-usage', () => pushUsage());
-ipcMain.on('set-interactive', (_e, v) => {
-  if (win && !win.isDestroyed()) win.setIgnoreMouseEvents(!v, { forward: true });
-});
-ipcMain.on('drag-start', startDrag);
-ipcMain.on('drag-end', endDrag);
-ipcMain.on('feed', () => feedPet());
-ipcMain.on('buy', (_e, id) => buyItem(id));
-ipcMain.on('played', () => { markQuest('play'); pushGame(); });
-// Right-click the mascot -> same menu as the tray (so the app is controllable
-// even when the menu-bar icon is hidden behind the notch).
-ipcMain.on('context-menu', () => {
-  if (win && !win.isDestroyed()) buildTrayMenu().popup({ window: win });
-});
+  // ---------------- autostart + Start menu shortcut (Windows) ----------------
+  const programs = path.join(app.getPath('appData'), 'Microsoft', 'Windows', 'Start Menu', 'Programs');
+  const startupLink = path.join(programs, 'Startup', `${APP_NAME}.lnk`);
+  const startMenuLink = path.join(programs, `${APP_NAME}.lnk`);
+  function linkOptions() {
+    return {
+      target: process.execPath,
+      args: app.isPackaged ? '' : `"${app.getAppPath()}"`,
+      cwd: app.getAppPath(),
+      description: 'Clawd mostrando o ritmo de uso do Claude',
+      icon: path.join(__dirname, 'build', 'icon.ico'),
+      iconIndex: 0,
+      appUserModelId: APP_ID,
+    };
+  }
+  function syncAutostart() {
+    if (process.platform !== 'win32') { app.setLoginItemSettings({ openAtLogin: settings.autostart }); return; }
+    try {
+      if (settings.autostart) shell.writeShortcutLink(startupLink, 'create', linkOptions());
+      else if (fs.existsSync(startupLink)) fs.unlinkSync(startupLink);
+    } catch (e) { console.error('autostart', e.message); }
+  }
+  function install() {
+    if (process.platform === 'win32') {
+      // Start-menu entry carries the AppUserModelID so toasts show "Clawd Pace".
+      try { shell.writeShortcutLink(startMenuLink, 'create', linkOptions()); } catch (e) { console.error('start menu', e.message); }
+    }
+    syncAutostart();
+    if (!settings.installed) { settings.installed = true; saveSettings(); }
+  }
 
-app.whenReady().then(() => {
-  loadSettings();
-  loadPet();
-  loadGame();
-  createWindow();
-  createTray();
-  win.webContents.once('did-finish-load', () => { applySettings(); pushPet(); pushGame(); });
-  pushUsage();
-  setInterval(pushUsage, REFRESH_MS);
-  scheduleLimits(); // self-schedules with 429 backoff (no fixed interval)
-  setInterval(pushPet, 20000); // tick the pet every 20s
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  // ---------------- IPC ----------------
+  const fromPet = (e) => win && e.sender === win.webContents;
+  const fromPanel = (e) => panel && e.sender === panel.webContents;
+  ipcMain.on('set-interactive', (e, v) => { if (fromPet(e)) { win.setIgnoreMouseEvents(!v, { forward: true }); dlog('interactive ' + !!v); } });
+  ipcMain.on('drag-start', (e) => { if (fromPet(e)) startDrag(); });
+  ipcMain.on('drag-end', (e) => { if (fromPet(e)) endDrag(); });
+  ipcMain.on('menu', (e) => { if (fromPet(e) || fromPanel(e)) popMenu(); });
+  ipcMain.on('refresh', (e) => { if (fromPanel(e)) { refreshLimits('manual'); scan(); } });
+  ipcMain.on('panel-height', (e, h) => { if (fromPanel(e) && Number.isFinite(h)) placePanel(Math.max(200, Math.min(1400, Math.round(h)))); });
+  ipcMain.on('panel-close', (e) => { if (fromPanel(e)) panel.close(); });
+
+  // ---------------- boot ----------------
+  app.on('second-instance', () => { if (win) { if (!win.isVisible()) win.showInactive(); bringBack(); } });
+  app.on('window-all-closed', (e) => e.preventDefault && e.preventDefault());
+
+  app.whenReady().then(() => {
+    install();
+    createPet();
+    createTray();
+    watchSources();
+    readFeed();
+    refreshLimits('boot');
+    scan();
+
+    setInterval(tick, 50); // 20 fps is plenty for pixel art and keeps CPU low
+    setInterval(() => { if (Date.now() - lastFetch > POLL_MS) refreshLimits('poll'); }, 30e3);
+    setInterval(scan, SCAN_MS);
+    setInterval(() => pushState(), 30e3); // time moves -> pace moves
+    setInterval(() => { if (win && !win.isDestroyed()) win.setAlwaysOnTop(true, 'screen-saver'); }, 60e3);
+
+    if (SNAP) {
+      const cap = async (w, name) => { if (w && !w.isDestroyed()) fs.writeFileSync(path.join(SNAP, name), (await w.webContents.capturePage()).toPNG()); };
+      if (!TEST) setTimeout(togglePanel, 4000);
+      setTimeout(() => { fs.writeFileSync(path.join(SNAP, 'bounds.json'), JSON.stringify(win.getBounds())); dlog('ready'); }, 3000);
+      setTimeout(async () => { await cap(panel, 'panel.png'); await cap(win, 'pet.png'); fs.writeFileSync(path.join(SNAP, 'tray.png'), trayIcon(pace.session, pace.week, false).resize({ width: 128, height: 128, quality: 'good' }).toPNG()); }, 9000);
+    }
+
+    powerMonitor.on('resume', () => setTimeout(() => refreshLimits('resume'), 5000));
+    powerMonitor.on('unlock-screen', () => { pushState(); refreshLimits('unlock'); });
+    screen.on('display-removed', bringBack);
+    screen.on('display-metrics-changed', () => {
+      const b = win.getBounds();
+      const a = workAreaFor(b);
+      if (b.x > a.x + a.width - 40 || b.y > a.y + a.height) bringBack();
+    });
   });
-});
 
-app.on('window-all-closed', (e) => e.preventDefault());
-app.dock && app.dock.hide();
+  app.on('before-quit', () => { history.save(); saveLast(); if (worker) worker.terminate(); });
+}

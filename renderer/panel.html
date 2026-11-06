@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:;" />
+<title>Clawd Pace</title>
+<link rel="stylesheet" href="panel.css" />
+</head>
+<body>
+  <main id="card">
+    <header>
+      <div class="brand"><span class="dot"></span>Clawd Pace <span id="plan" class="chip"></span></div>
+      <div class="actions">
+        <button id="btn-refresh" title="Atualizar agora" aria-label="Atualizar agora">⟳</button>
+        <button id="btn-menu" title="Configurações" aria-label="Configurações">⋯</button>
+      </div>
+    </header>
+
+    <p id="headline" class="headline"></p>
+    <p id="error" class="error" hidden></p>
+
+    <section id="sec-session">
+      <div class="sec-head">
+        <h2>Sessão <span class="sub">· janela de 5h</span></h2>
+        <span class="status"></span>
+        <span class="big"></span>
+      </div>
+      <div class="meter"><i class="fill"></i><i class="tick"></i></div>
+      <ul class="facts"></ul>
+      <svg class="spark" viewBox="0 0 312 34" preserveAspectRatio="none"></svg>
+      <div class="axis"><span class="a0"></span><span class="a1"></span></div>
+    </section>
+
+    <section id="sec-week">
+      <div class="sec-head">
+        <h2>Semana <span class="sub">· todos os modelos</span></h2>
+        <span class="status"></span>
+        <span class="big"></span>
+      </div>
+      <div class="meter"><i class="fill"></i><i class="tick"></i></div>
+      <ul class="facts"></ul>
+      <svg class="spark" viewBox="0 0 312 34" preserveAspectRatio="none"></svg>
+      <div class="axis"><span class="a0"></span><span class="a1"></span></div>
+      <div id="breakdown" hidden>
+        <h3>Onde foi a semana</h3>
+        <div class="stack"></div>
+        <div class="legend"></div>
+      </div>
+      <div id="scoped"></div>
+    </section>
+
+    <section id="sec-activity">
+      <div class="sec-head"><h2>Atividade <span class="sub">· logs locais do Claude Code</span></h2></div>
+      <div class="kpis">
+        <div><b id="k-msgs">–</b><span>msgs hoje</span></div>
+        <div><b id="k-tok">–</b><span>tokens hoje</span></div>
+        <div><b id="k-usd">–</b><span>≈ valor API hoje</span></div>
+      </div>
+      <h3>Últimos 7 dias <span class="sub">≈ valor em API por dia</span></h3>
+      <svg id="days" viewBox="0 0 312 62"></svg>
+      <h3>Que horas você usa <span class="sub">mensagens por hora · 7 dias</span></h3>
+      <svg id="hours" viewBox="0 0 312 50"></svg>
+      <ul class="facts" id="act-facts"></ul>
+    </section>
+
+    <footer id="foot"></footer>
+  </main>
+  <div id="tip" role="tooltip"></div>
+  <script src="panel.js"></script>
+</body>
+</html>

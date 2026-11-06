@@ -1,108 +1,90 @@
-# 🟧 Claude Usage Pet
+# Clawd Pace
 
-> A coral pixel mascot named **Clawd** who lives on your screen and shows your **real Claude Code usage** — plan limits, cost, streaks — and grows as a little **Tamagotchi** you feed and play with.
+O Clawd mora em cima da sua barra de tarefas e mostra, num olhar, **o ritmo de uso do seu plano Claude**: a sessão de 5h e o limite semanal.
 
-No more typing `/usage`. Just glance at Clawd. 🐾
+Fork de [plugin87/claude-usage-pet](https://github.com/plugin87/claude-usage-pet) (MIT). O original foi auditado, a gamificação (fome, moedas, loja, quests) saiu, e o foco passou a ser o **pace**.
 
-![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-555)
-![electron](https://img.shields.io/badge/built%20with-Electron-47848F)
-![license](https://img.shields.io/badge/license-MIT-green)
+## Como ler
 
----
-
-## Install
-
-```bash
-npx claude-usage-pet           # run instantly, no install
-# or
-npm install -g claude-usage-pet
-claude-usage-pet               # alias: clawd
+```
+ 5h ▕██████|░░░▏ 57% ▲      barra = quanto já usou
+sem ▕████████|░▏ 75% ▲      traço branco = onde você "deveria" estar se gastasse por igual até o reset
 ```
 
-Runs on **macOS, Windows, and Linux** (anything with Node 18+). Because it runs
-from your locally-installed package, there's **no macOS "damaged" Gatekeeper
-prompt** like prebuilt `.dmg`/`.exe` files get. Quit anytime via the mascot's
-right-click menu → **Quit**.
+| Cor / ícone | Significa |
+|---|---|
+| verde ✓ | no ritmo atual, você chega no reset com folga |
+| âmbar ! | vai chegar perto de 100% no reset |
+| vermelho ▲ | no ritmo atual, **acaba antes do reset** |
+| ■ | esgotado |
 
-> First install pulls in Electron (a few hundred MB).
+O próprio Clawd também reflete o estado:
 
----
+- **Calmo**: anda devagar, descansa bastante.
+- **Claude trabalhando**: os logs do Claude Code estão mexendo, então ele anda mais rápido.
+- **Acima do ritmo**: fica avermelhado, sua e solta fumaça, andando de um lado pro outro.
+- **Esgotado**: olhos em X, com estrelinhas girando.
+- **Você ausente**: depois de 10 min sem mexer no PC, ele dorme (zzz).
+- **Sessão renovada**: pula e solta corações.
 
-## What you get
+**Passar o mouse** mostra a frase-resumo (ex.: "5h acaba ~18:15 (reset 19:09)"). **Clicar** abre o painel com projeção, histórico, breakdown da semana (Claude Code / Cowork / Chats) e atividade local (msgs, horário de pico, ≈ valor em API). **Arrastar** pega ele no colo; ao soltar, ele cai de volta na barra. **Clique direito** abre o menu.
 
-### 🐾 A living desktop pet
-Clawd walks, rests, sits, blinks, jumps, sends little hearts, and every so often
-takes off on a **jet ✈️**, a **bike ride 🚲**, or does a quick **run 🏃** across
-your screen. **Drag** him anywhere; **click** to open his panel; **right-click**
-for the menu.
+O ícone na bandeja mostra a % da sessão na cor do status, com uma barrinha da semana embaixo.
 
-### 📊 Real usage at a glance — click Clawd
-A tabbed panel powered by your actual Claude Code data:
+## Como o pace é calculado
 
-| Tab | Shows |
-|-----|-------|
-| **Limits** | Real **Session (5h)** + **Weekly** utilisation, **% left**, reset times, and a burn-rate estimate ("on track ✓" / "⚠️ limit in ~2d"). |
-| **Cost** | Estimated **USD value** at API rates — today / week / 30-day, per model. |
-| **Activity** | 7-day chart (tokens or $), total tokens, messages, sessions, top project. |
-| **🏆 Awards** | Level + XP, 🔥 streak, 🪙 coins, achievements, daily quest, and a treat shop. |
+- **Sessão (5h)**: projeção pelo ritmo dos **últimos 30 min**. Se você parar, a projeção para junto, então só avisa quando você está queimando *agora*.
+- **Semana**: projeção pela **média desde o início da semana**. "Pra chegar redondo" é quanto você pode gastar por dia daqui até o reset.
+- **Alertas** (toast do Windows): sessão projetada pra estourar, sessão ≥ 90%, semana acima do ritmo (no máximo 1×/dia), semana ≥ 90%, sessão renovada.
 
-The plan limits are the **same numbers `/usage` shows** — Clawd reads your Claude
-Code OAuth token locally and calls the same endpoint. Your menu-bar icon also
-shows the live % at a glance.
+## De onde vêm os dados
 
-### 🎮 Tamagotchi + gamification
-- **Hunger & energy** that change over real time — Clawd gets hungry (🍪 thought
-  bubble), lazy, and eventually **sleeps** (Zzz). **Feed** him to perk him up.
-- **Level up** from your token usage, **🔥 daily streaks** from real activity,
-  **achievements**, **daily quests**, and **🪙 coins** to spend on treats.
-- Clawd's mood reacts to your limits — a calm glow when you're fine, a worried
-  red pulse when you're near a cap.
+1. **Limites do plano**: o mesmo endpoint que o `/usage` do Claude Code usa (`api.anthropic.com/api/oauth/usage`), com o token OAuth em `~/.claude/.credentials.json`.
+   - O token só é enviado para `api.anthropic.com`. Nunca é logado nem salvo em outro lugar.
+   - O app **nunca renova o token**: renovar por fora deslogaria o Claude Code. Quando o token expira, o app espera o Claude Code renovar e atualiza na hora (vigia o arquivo).
+   - Ritmo das chamadas: a cada 5 min. Quando o Claude Code está ativo, pode atualizar a cada 90 s. Se receber 429, espera de 5 a 30 min antes de tentar de novo.
+2. **Statusline (opcional, tempo real)**: `statusline.js` recebe os `rate_limits` do próprio Claude Code (sem rede, sem token) e grava em `~/.claude/clawd-pace/feed.json`. Só funciona no Claude Code de terminal (a extensão do VS Code não roda statusline).
+3. **Atividade local**: lê `~/.claude/projects/**/*.jsonl` numa worker thread, de forma incremental (só os bytes novos), com cache. A primeira leitura de ~1,6 GB leva ~4 s em segundo plano; depois disso, ~6 ms.
 
-### 🔔 Stay informed
-Desktop notifications at **80% / 90%** usage and when a limit **resets**, so you
-never get cut off mid-flow.
+## Segurança
 
----
+- Janelas com `contextIsolation`, `sandbox` e sem `nodeIntegration`. CSP `default-src 'none'`, sem nenhum script remoto. Navegação e popups bloqueados.
+- Dado vindo da API entra na tela só via `textContent` (sem `innerHTML`).
+- Única dependência: `electron` (`npm audit`: 0 vulnerabilidades).
+- Mudanças fora desta pasta: atalho em `Inicializar` e no Menu Iniciar, estado em `%APPDATA%\Clawd Pace`, e `statusLine` em `~/.claude/settings.json` (backup em `settings.json.bak-clawd`).
 
-## How it works
+## Uso
 
-Everything is local and private:
-
-- **Usage & cost** are parsed from your session logs in
-  `~/.claude/projects/**/*.jsonl` (incremental — only changed files are re-read).
-- **Plan limits** come from the same OAuth endpoint `/usage` uses. The token is
-  read from your macOS Keychain (`Claude Code-credentials`) or
-  `~/.claude/.credentials.json` on Windows/Linux. **It never leaves your machine
-  and is never logged.**
-- If you're not logged into Claude Code, the panel falls back to showing usage
-  vs. your own busiest day/week.
-
----
-
-## Settings & controls
-
-Right-click the mascot (or the menu-bar icon):
-
-- **Feed Clawd 🍪**, take a **jet flight ✈️** / **bike ride 🚲**
-- **Settings** → menu-bar metric (weekly/session), pet size, notifications on/off, jet on/off
-- **Refresh**, **Reset position**, **Open at login**, **Quit**
-
----
-
-## Build native apps (optional)
-
-```bash
-npm run pack        # quick unpacked build
-npm run dist:mac    # universal .dmg + .zip (sign/notarize: see NOTARIZE.md)
-npm run dist:win    # Windows installer + portable
+```powershell
+cd C:\Users\Matheus\clawd-pace
+npm install          # se o Electron não baixar: node node_modules/electron/install.js
+npm start            # ou: Menu Iniciar > Clawd Pace
+npm test             # testes do motor de pace
 ```
 
----
+- **Inicia com o Windows** por padrão. Para desligar: clique direito no Clawd > "Iniciar com o Windows".
+- Se rodar de dentro do terminal da extensão do VS Code e o app não abrir, a causa é a variável `ELECTRON_RUN_AS_NODE=1` herdada da extensão. Abra pelo Menu Iniciar.
+- Consumo medido: ~1% de um núcleo parado/dormindo e ~6–7% andando agitado (0,8% da CPU total). Desligar "Andar pela tela" deixa sempre no mínimo.
 
-## Disclaimer
+## Desinstalar
 
-Unofficial, community-made, and not affiliated with or endorsed by Anthropic.
-"Claude" is a trademark of Anthropic. Cost figures are **estimates** of
-equivalent API pricing — on a subscription you don't actually pay per token.
+1. Clique direito no Clawd > Sair.
+2. Apague `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Clawd Pace.lnk`, `...\Programs\Clawd Pace.lnk` e `%APPDATA%\Clawd Pace`.
+3. Remova a chave `statusLine` de `~/.claude/settings.json`.
+4. Apague esta pasta.
 
-MIT © [plugin87](https://github.com/plugin87)
+## Arquivos
+
+| Arquivo | O quê |
+|---|---|
+| `main.js` | janelas, caminhada, bandeja, polling, alertas, autostart |
+| `pace.js` | motor de pace (puro, testado em `test/`) |
+| `limits.js` | leitura dos limites do plano |
+| `usage.js` + `usage-worker.js` | stats locais dos logs (worker thread) |
+| `history.js` | série temporal para burn-rate e gráficos |
+| `trayicon.js` | ícone da bandeja desenhado pixel a pixel |
+| `statusline.js` | feed em tempo real via statusline do Claude Code |
+| `renderer/pet.*` | o Clawd (SVG pixel art) + HUD |
+| `renderer/panel.*` | painel de detalhes |
+
+O Clawd é personagem da Anthropic. Este é um projeto de fã, para uso pessoal, sem afiliação com a Anthropic.
