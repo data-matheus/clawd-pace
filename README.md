@@ -31,6 +31,10 @@ O próprio Clawd também reflete o estado:
 
 O ícone na bandeja mostra a % da sessão na cor do status, com uma barrinha da semana embaixo.
 
+### Cor do Clawd
+
+Clique direito no Clawd (ou no ícone da bandeja) > **Cor do Clawd…**. Aceita qualquer hex (`#RRGGBB` ou `#RGB`), o seletor nativo ou 16 presets, e aplica na hora. Os tons de humor (no limite, acima do ritmo, esgotado) são derivados da cor escolhida. Os olhos ficam claros sozinhos em cores escuras. "Restaurar laranja Claude" volta ao padrão `#D97757`.
+
 ## Como o pace é calculado
 
 - **Sessão (5h)**: projeção pelo ritmo dos **últimos 30 min**. Se você parar, a projeção para junto, então só avisa quando você está queimando *agora*.
@@ -59,7 +63,7 @@ O ícone na bandeja mostra a % da sessão na cor do status, com uma barrinha da 
 cd C:\Users\Matheus\clawd-pace
 npm install          # se o Electron não baixar: node node_modules/electron/install.js
 npm start            # ou: Menu Iniciar > Clawd Pace
-npm test             # testes do motor de pace
+npm test             # testes do motor de pace e das cores
 ```
 
 - **Inicia com o Windows** por padrão. Para desligar: clique direito no Clawd > "Iniciar com o Windows".
@@ -83,8 +87,10 @@ npm test             # testes do motor de pace
 | `usage.js` + `usage-worker.js` | stats locais dos logs (worker thread) |
 | `history.js` | série temporal para burn-rate e gráficos |
 | `trayicon.js` | ícone da bandeja desenhado pixel a pixel |
+| `color.js` | validação de hex e contraste dos olhos (testado em `test/`) |
 | `statusline.js` | feed em tempo real via statusline do Claude Code |
 | `renderer/pet.*` | o Clawd (SVG pixel art) + HUD |
 | `renderer/panel.*` | painel de detalhes |
+| `renderer/settings.*` | janela de configurações (cor) |
 
 O Clawd é personagem da Anthropic. Este é um projeto de fã, para uso pessoal, sem afiliação com a Anthropic.

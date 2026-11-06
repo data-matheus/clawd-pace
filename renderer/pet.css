@@ -8,7 +8,8 @@
   --ok: #0ca30c;
   --tight: #fab219;
   --over: #d03b3b;
-  --body: #d97757;
+  --base: #d97757; /* user-chosen colour (Configurações) */
+  --body: var(--base);
   --eye: #1a1a19;
   --u: 5px; /* one Clawd pixel */
 }
@@ -92,9 +93,10 @@ body.hovering .head:not(:empty), body.show-head .head:not(:empty) { display: blo
 .leg { transform-box: fill-box; transform-origin: 50% 0; transition: transform 0.08s; }
 
 /* mood tint */
-body.mood-tight { --body: #dd6e4e; }
-body.mood-over { --body: #e2553e; }
-body.mood-maxed { --body: #a0705f; }
+/* mood tints are derived from whatever colour the user picked */
+body.mood-tight { --body: color-mix(in oklab, var(--base) 80%, #e0352b); }
+body.mood-over { --body: color-mix(in oklab, var(--base) 58%, #e0352b); }
+body.mood-maxed { --body: color-mix(in oklab, var(--base) 50%, #6b6a65); }
 
 
 /* walking: legs alternate (classes toggled from JS), body bobs */

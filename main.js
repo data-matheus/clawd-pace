@@ -13,6 +13,7 @@ const { computePace } = require('./pace');
 const { createHistory } = require('./history');
 const { PROJECTS_DIR } = require('./usage');
 const { trayIcon } = require('./trayicon');
+const { DEFAULT_COLOR, normHex } = require('./color');
 
 const APP_ID = 'com.matheus.clawdpace';
 const APP_NAME = 'Clawd Pace';
@@ -44,8 +45,10 @@ function start() {
   const file = (n) => path.join(dataDir, n);
 
   // ---------------- settings ----------------
-  const settings = { walk: true, hud: 'always', size: 'm', notify: true, autostart: true, installed: false, pos: null };
+  const settings = { walk: true, hud: 'always', size: 'm', notify: true, autostart: true, installed: false, pos: null, color: null };
   try { Object.assign(settings, JSON.parse(fs.readFileSync(file('settings.json'), 'utf8'))); } catch { /* defaults */ }
+  settings.color = normHex(settings.color); // ignore a hand-edited invalid value
+  const clawdColor = () => settings.color || DEFAULT_COLOR;
   const saveSettings = () => { try { fs.writeFileSync(file('settings.json'), JSON.stringify(settings, null, 1)); } catch { /* ignore */ } };
 
   // ---------------- state ----------------
@@ -67,6 +70,7 @@ function start() {
 
   let win = null;
   let panel = null;
+  let settingsWin = null;
   let panelClosedAt = 0;
   let tray = null;
 
@@ -130,6 +134,7 @@ function start() {
       stale: stale(),
       hud: settings.hud,
       size: settings.size,
+      color: clawdColor(),
     };
   }
 
@@ -146,6 +151,7 @@ function start() {
       usage,
       working: Date.now() - lastActivityTs < WORKING_MS,
       headline: headline(pace),
+      color: clawdColor(),
       sessionSeries: sr ? all.filter((p) => p.sr && Math.abs(p.sr - sr) < 5 * 60e3).map((p) => [p.t, p.s]) : [],
       weekSeries: wr ? all.filter((p) => p.wr && Math.abs(p.wr - wr) < 5 * 60e3).map((p) => [p.t, p.w]) : [],
       labels: {
@@ -360,6 +366,35 @@ function start() {
     });
   }
 
+  // ---------------- settings window (Clawd colour) ----------------
+  function sendSettings() {
+    if (settingsWin && !settingsWin.isDestroyed()) settingsWin.webContents.send('settings-state', { color: clawdColor(), defaultColor: DEFAULT_COLOR });
+  }
+  function openSettings() {
+    if (settingsWin && !settingsWin.isDestroyed()) { settingsWin.show(); settingsWin.focus(); return; }
+    if (panel && !panel.isDestroyed()) panel.close();
+    settingsWin = new BrowserWindow({
+      width: 380,
+      height: 470,
+      useContentSize: true,
+      resizable: false,
+      maximizable: false,
+      minimizable: false,
+      fullscreenable: false,
+      autoHideMenuBar: true,
+      backgroundColor: '#1c1b1a',
+      title: 'Clawd Pace · Configurações',
+      icon: path.join(__dirname, 'build', 'icon.ico'),
+      show: false,
+      webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
+    });
+    settingsWin.removeMenu();
+    lockDown(settingsWin);
+    settingsWin.loadFile(path.join(__dirname, 'renderer', 'settings.html'));
+    settingsWin.webContents.once('did-finish-load', () => { sendSettings(); settingsWin.show(); });
+    settingsWin.on('closed', () => { settingsWin = null; });
+  }
+
   function lockDown(w) {
     w.webContents.on('will-navigate', (e) => e.preventDefault());
     w.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -533,7 +568,7 @@ function start() {
     if (!tray) return;
     const hasData = !!plan;
     try {
-      tray.setImage(trayIcon(hasData ? pace.session : null, hasData ? pace.week : null, stale()));
+      tray.setImage(trayIcon(hasData ? pace.session : null, hasData ? pace.week : null, stale(), clawdColor()));
     } catch (e) { console.error('tray icon', e.message); }
     const s = pace.session;
     const w = pace.week;
@@ -584,6 +619,7 @@ function start() {
           { label: 'Grande', type: 'radio', checked: settings.size === 'l', click: () => set('size', 'l') },
         ],
       },
+      { label: 'Cor do Clawd…', click: openSettings },
       { label: 'Notificações de ritmo', type: 'checkbox', checked: settings.notify, click: (i) => set('notify', i.checked) },
       { label: 'Iniciar com o Windows', type: 'checkbox', checked: settings.autostart, click: (i) => { set('autostart', i.checked); syncAutostart(); } },
       { type: 'separator' },
@@ -608,7 +644,7 @@ function start() {
     petEvent('celebrate');
   }
   function createTray() {
-    tray = new Tray(trayIcon(null, null, true));
+    tray = new Tray(trayIcon(null, null, true, clawdColor()));
     tray.on('click', togglePanel);
     tray.on('right-click', () => tray.popUpContextMenu(buildMenu()));
     refreshTray();
@@ -648,6 +684,16 @@ function start() {
   // ---------------- IPC ----------------
   const fromPet = (e) => win && e.sender === win.webContents;
   const fromPanel = (e) => panel && e.sender === panel.webContents;
+  const fromSettings = (e) => settingsWin && !settingsWin.isDestroyed() && e.sender === settingsWin.webContents;
+  ipcMain.on('set-color', (e, v) => {
+    if (!fromSettings(e)) return;
+    const c = v === null ? null : normHex(v);
+    if (v !== null && !c) return; // invalid hex: keep the current colour
+    settings.color = c === DEFAULT_COLOR ? null : c;
+    saveSettings();
+    pushState(true);
+    sendSettings();
+  });
   ipcMain.on('set-interactive', (e, v) => { if (fromPet(e)) { win.setIgnoreMouseEvents(!v, { forward: true }); dlog('interactive ' + !!v); } });
   ipcMain.on('drag-start', (e) => { if (fromPet(e)) startDrag(); });
   ipcMain.on('drag-end', (e) => { if (fromPet(e)) endDrag(); });
@@ -678,8 +724,10 @@ function start() {
     if (SNAP) {
       const cap = async (w, name) => { if (w && !w.isDestroyed()) fs.writeFileSync(path.join(SNAP, name), (await w.webContents.capturePage()).toPNG()); };
       if (!TEST) setTimeout(togglePanel, 4000);
+      setTimeout(openSettings, 3500);
+      setTimeout(() => cap(settingsWin, 'settings.png'), 8500);
       setTimeout(() => { fs.writeFileSync(path.join(SNAP, 'bounds.json'), JSON.stringify(win.getBounds())); dlog('ready'); }, 3000);
-      setTimeout(async () => { await cap(panel, 'panel.png'); await cap(win, 'pet.png'); fs.writeFileSync(path.join(SNAP, 'tray.png'), trayIcon(pace.session, pace.week, false).resize({ width: 128, height: 128, quality: 'good' }).toPNG()); }, 9000);
+      setTimeout(async () => { await cap(panel, 'panel.png'); await cap(win, 'pet.png'); fs.writeFileSync(path.join(SNAP, 'tray.png'), trayIcon(null, null, false, clawdColor()).resize({ width: 128, height: 128, quality: 'good' }).toPNG()); }, 9000);
     }
 
     powerMonitor.on('resume', () => setTimeout(() => refreshLimits('resume'), 5000));

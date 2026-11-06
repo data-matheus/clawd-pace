@@ -19,4 +19,7 @@ contextBridge.exposeInMainWorld('clawd', {
   refresh: () => ipcRenderer.send('refresh'),
   panelHeight: (h) => ipcRenderer.send('panel-height', Number(h)),
   closePanel: () => ipcRenderer.send('panel-close'),
+  // settings
+  onSettings: on('settings-state'),
+  setColor: (hex) => ipcRenderer.send('set-color', hex === null ? null : String(hex)),
 });

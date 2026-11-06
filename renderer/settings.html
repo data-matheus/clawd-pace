@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:;" />
+<title>Clawd Pace · Configurações</title>
+<link rel="stylesheet" href="settings.css" />
+</head>
+<body>
+  <main>
+    <h1>Cor do Clawd</h1>
+
+    <div class="preview">
+      <svg id="clawd" viewBox="-1 -1 18 12" shape-rendering="crispEdges" aria-label="Prévia do Clawd">
+        <g class="b">
+          <rect x="3" y="7" width="1" height="2" /><rect x="5" y="7" width="1" height="2" />
+          <rect x="10" y="7" width="1" height="2" /><rect x="12" y="7" width="1" height="2" />
+          <rect x="2" y="0" width="12" height="7.2" />
+          <rect x="0" y="3" width="2" height="2" /><rect x="14" y="3" width="2" height="2" />
+        </g>
+        <g class="eye"><rect x="5" y="2" width="1" height="2" /><rect x="10" y="2" width="1" height="2" /></g>
+      </svg>
+      <div class="moods">
+        <span><i class="m-ok"></i>normal</span>
+        <span><i class="m-tight"></i>no limite</span>
+        <span><i class="m-over"></i>acima</span>
+        <span><i class="m-maxed"></i>esgotado</span>
+      </div>
+    </div>
+
+    <label for="hex">Hex</label>
+    <div class="row">
+      <input id="hex" type="text" spellcheck="false" autocomplete="off" maxlength="7" placeholder="#D97757" aria-describedby="hint" />
+      <input id="picker" type="color" aria-label="Escolher cor" />
+    </div>
+    <p id="hint" class="hint">Qualquer hex: <code>#RRGGBB</code> ou <code>#RGB</code>. Aplica na hora.</p>
+
+    <div class="swatches" id="swatches"></div>
+
+    <div class="actions">
+      <button id="reset" type="button">Restaurar laranja Claude</button>
+      <button id="done" type="button" class="primary">Pronto</button>
+    </div>
+  </main>
+  <script src="settings.js"></script>
+</body>
+</html>

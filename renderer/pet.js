@@ -23,8 +23,23 @@ function renderRow(id, w) {
   row.querySelector('.ico').textContent = ICON[w.state] || '';
 }
 
+// readable eyes on any body colour (mirror of color.js)
+function eyeColor(hex) {
+  const lin = (c) => { const s = c / 255; return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4; };
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b) < 0.18 ? '#f0efec' : '#1a1a19';
+}
+let appliedColor = null;
+function applyColor(hex) {
+  if (!/^#[0-9a-f]{6}$/i.test(hex || '') || hex === appliedColor) return;
+  appliedColor = hex;
+  document.documentElement.style.setProperty('--base', hex);
+  document.documentElement.style.setProperty('--eye', eyeColor(hex));
+}
+
 function render() {
   if (!st) return;
+  applyColor(st.color);
   body.className = `size-${st.size} mood-${st.mood}` + (st.hud === 'hover' ? ' hud-hover' : '') + (hovering ? ' hovering' : '') + (st.stale ? ' stale' : '') + (st.err === 'expired' || !st.hasData ? ' show-head' : '');
   if (st.hasData) {
     renderRow('r-s', st.session);

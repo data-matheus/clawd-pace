@@ -14,7 +14,8 @@ const STATUS = {
 };
 const BG = [0x1c, 0x1b, 0x1a];
 const TRACK = [0x45, 0x44, 0x40];
-const CLAWD = [0xd9, 0x77, 0x57];
+const DEFAULT_CLAWD = [0xd9, 0x77, 0x57];
+const rgb = (hex) => (/^#[0-9a-f]{6}$/i.test(hex || '') ? [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16)) : DEFAULT_CLAWD);
 const MUTED = [0x8f, 0x8e, 0x88];
 
 // 3x5 digits
@@ -31,7 +32,8 @@ const FONT = {
   9: ['111', '101', '111', '001', '111'],
 };
 
-function draw(S, session, week, stale) {
+function draw(S, session, week, stale, bodyHex) {
+  const CLAWD = rgb(bodyHex);
   const px = Buffer.alloc(S * S * 4); // BGRA
   const set = (x, y, [r, g, b], a = 255) => {
     if (x < 0 || y < 0 || x >= S || y >= S) return;
@@ -89,9 +91,9 @@ function draw(S, session, week, stale) {
   return px;
 }
 
-function trayIcon(session, week, stale) {
-  const img = nativeImage.createFromBitmap(draw(16, session, week, stale), { width: 16, height: 16, scaleFactor: 1 });
-  const big = nativeImage.createFromBitmap(draw(32, session, week, stale), { width: 32, height: 32, scaleFactor: 2 });
+function trayIcon(session, week, stale, color) {
+  const img = nativeImage.createFromBitmap(draw(16, session, week, stale, color), { width: 16, height: 16, scaleFactor: 1 });
+  const big = nativeImage.createFromBitmap(draw(32, session, week, stale, color), { width: 32, height: 32, scaleFactor: 2 });
   img.addRepresentation({ scaleFactor: 2, width: 32, height: 32, buffer: big.toPNG() });
   return img;
 }

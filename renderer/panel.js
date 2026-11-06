@@ -291,6 +291,7 @@ let state = null;
 function render() {
   const s = state;
   if (!s) return;
+  if (/^#[0-9a-f]{6}$/i.test(s.color || '')) document.documentElement.style.setProperty('--clawd', s.color);
   $('#plan').textContent = (s.plan && s.plan.planName) || '';
   $('#headline').textContent = s.plan ? s.headline : 'Buscando seus limites…';
   const err = $('#error');
