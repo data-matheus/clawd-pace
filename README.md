@@ -57,6 +57,18 @@ Clique direito no Clawd (ou no ícone da bandeja) > **Cor do Clawd…**. Aceita 
 - Única dependência: `electron` (`npm audit`: 0 vulnerabilidades).
 - Mudanças fora desta pasta: atalho em `Inicializar` e no Menu Iniciar, estado em `%APPDATA%\Clawd Pace`, e `statusLine` em `~/.claude/settings.json` (backup em `settings.json.bak-clawd`).
 
+## Instalar em outro PC
+
+1. Copie a pasta do projeto (sem `node_modules`) ou clone o repositório, por exemplo em `C:Users<nome>clawd-pace`.
+2. Dê dois cliques em **`instalar.cmd`**. O script:
+   - confere o Node.js (se não tiver, instala o LTS pelo `winget` ou abre o site);
+   - instala as dependências e garante o binário do Electron;
+   - avisa se o Claude Code não estiver logado;
+   - abre o Clawd. Na primeira execução, o próprio app cria os atalhos no Menu Iniciar e na inicialização do Windows.
+3. Não mova a pasta depois. Se mover, rode o `instalar.cmd` de novo no lugar novo.
+
+O app mostra o plano de **quem está logado no Claude Code daquele PC**. Quem só usa o claude.ai no navegador precisa instalar o Claude Code e fazer login uma vez. Mesmo assim, o login expira se o Claude Code não for usado.
+
 ## Uso
 
 ```powershell
