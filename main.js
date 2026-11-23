@@ -14,6 +14,7 @@ const { createHistory } = require('./history');
 const { PROJECTS_DIR } = require('./usage');
 const { trayIcon } = require('./trayicon');
 const { DEFAULT_COLOR, normHex } = require('./color');
+const { createRefresher, DEFAULT_CRED } = require('./refresh');
 
 const APP_ID = 'com.matheus.clawdpace';
 const APP_NAME = 'Clawd Pace';
@@ -45,7 +46,7 @@ function start() {
   const file = (n) => path.join(dataDir, n);
 
   // ---------------- settings ----------------
-  const settings = { walk: true, hud: 'always', size: 'm', notify: true, autostart: true, installed: false, pos: null, color: null };
+  const settings = { walk: true, hud: 'always', size: 'm', notify: true, autostart: true, installed: false, pos: null, color: null, autoLogin: true };
   try { Object.assign(settings, JSON.parse(fs.readFileSync(file('settings.json'), 'utf8'))); } catch { /* defaults */ }
   settings.color = normHex(settings.color); // ignore a hand-edited invalid value
   const clawdColor = () => settings.color || DEFAULT_COLOR;
@@ -131,6 +132,7 @@ function start() {
       behavior: behavior(),
       headline: plan ? headline(pace) : planErr === 'no-token' ? 'Faça login no Claude Code' : 'Carregando…',
       err: planErr,
+      authNote,
       stale: stale(),
       hud: settings.hud,
       size: settings.size,
@@ -146,6 +148,7 @@ function start() {
       plan,
       pace,
       planErr,
+      authNote,
       stale: stale(),
       lastFetch,
       usage,
@@ -226,15 +229,30 @@ function start() {
     pushState();
   }
 
+  // Keeps the login alive while Claude Code is closed (see refresh.js for the safety rules).
+  const refresher = createRefresher({ credFile: DEFAULT_CRED, lockFile: path.join(FEED_DIR, 'refresh.lock'), logFile: file('auth.log') });
+  let authNote = null; // why we couldn't renew, for the UI
+  async function renewLogin() {
+    if (!settings.autoLogin) return false;
+    const r = await refresher.refresh();
+    authNote = r === 'claude-running' ? 'claude-open' : r.startsWith('failed') ? 'renew-failed' : null;
+    return r === 'ok';
+  }
+
   async function refreshLimits(reason) {
     if (inflight) return;
     if (reason !== 'manual' && Date.now() < backoffUntil) return;
     inflight = true;
     let r;
-    try { r = await fetchLimits(); } finally { inflight = false; }
+    try {
+      if (refresher.needsRefresh()) await renewLogin(); // token about to expire and Claude Code closed
+      r = await fetchLimits();
+      if (!r.ok && r.error === 'expired' && (await renewLogin())) r = await fetchLimits();
+    } finally { inflight = false; }
     lastFetch = Date.now();
     if (r.ok) {
       planErr = null;
+      authNote = null;
       backoffMs = 0;
       applyPlan(r.plan);
     } else {
@@ -620,6 +638,7 @@ function start() {
         ],
       },
       { label: 'Cor do Clawd…', click: openSettings },
+      { label: 'Renovar login sozinho (Claude Code fechado)', type: 'checkbox', checked: settings.autoLogin, click: (i) => { set('autoLogin', i.checked); if (i.checked) refreshLimits('manual'); } },
       { label: 'Notificações de ritmo', type: 'checkbox', checked: settings.notify, click: (i) => set('notify', i.checked) },
       { label: 'Iniciar com o Windows', type: 'checkbox', checked: settings.autostart, click: (i) => { set('autostart', i.checked); syncAutostart(); } },
       { type: 'separator' },

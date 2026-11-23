@@ -54,7 +54,7 @@ const STATUS = {
 };
 const COLOR = { ok: '#0ca30c', tight: '#fab219', over: '#d03b3b', maxed: '#d03b3b', fresh: '#c3c2b7' };
 const ERR = {
-  expired: 'O token do Claude Code expirou. Abra o Claude Code (VS Code ou terminal) que ele renova sozinho — o Clawd atualiza na hora.',
+  expired: 'O login do Claude Code expirou. Com o Claude Code fechado, o Clawd renova sozinho; com ele aberto, é o próprio Claude Code que renova no próximo uso.',
   'no-token': 'Não achei login do Claude Code neste PC (~/.claude/.credentials.json).',
   'http-429': 'A API pediu pra esperar (429). Tentando de novo em alguns minutos.',
   timeout: 'Sem resposta da API (timeout). Mostrando o último dado.',
@@ -296,7 +296,8 @@ function render() {
   $('#headline').textContent = s.plan ? s.headline : 'Buscando seus limites…';
   const err = $('#error');
   err.hidden = !s.planErr;
-  err.textContent = s.planErr ? ERR[s.planErr] || `Não consegui atualizar (${s.planErr}). Mostrando o último dado.` : '';
+  if (s.planErr === 'expired' && s.authNote === 'renew-failed') err.textContent = 'Não consegui renovar o login sozinho. Abra o Claude Code e faça login de novo; o Clawd volta na hora.';
+  else err.textContent = s.planErr ? ERR[s.planErr] || `Não consegui atualizar (${s.planErr}). Mostrando o último dado.` : '';
   if (s.plan) {
     renderSession(s);
     renderWeek(s);

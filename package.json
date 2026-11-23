@@ -7,7 +7,7 @@
   "private": true,
   "scripts": {
     "start": "electron .",
-    "test": "node test/pace.test.js && node test/color.test.js"
+    "test": "node test/pace.test.js && node test/color.test.js && node test/refresh.test.js"
   },
   "author": "Matheus Costa (fork) · plugin87 (original)",
   "license": "MIT",

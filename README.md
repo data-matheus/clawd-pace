@@ -45,7 +45,9 @@ Clique direito no Clawd (ou no ícone da bandeja) > **Cor do Clawd…**. Aceita 
 
 1. **Limites do plano**: o mesmo endpoint que o `/usage` do Claude Code usa (`api.anthropic.com/api/oauth/usage`), com o token OAuth em `~/.claude/.credentials.json`.
    - O token só é enviado para `api.anthropic.com`. Nunca é logado nem salvo em outro lugar.
-   - O app **nunca renova o token**: renovar por fora deslogaria o Claude Code. Quando o token expira, o app espera o Claude Code renovar e atualiza na hora (vigia o arquivo).
+   - **Sem VS Code aberto:** o login do Claude Code expira em ~8h. Com o Claude Code **fechado**, o Clawd renova sozinho, com a mesma requisição que o Claude Code faz. Com o Claude Code aberto, quem renova é o próprio Claude Code (o Clawd não mexe, pra não deslogar ele).
+     - Travas: lockfile; relê o arquivo antes e depois da requisição; backup em `.credentials.json.clawd-bak`; gravação atômica que preserva os outros campos; 1h de espera após uma falha. Log em `%APPDATA%Clawd Paceauth.log`.
+     - Pra desligar: clique direito > "Renovar login sozinho (Claude Code fechado)".
    - Ritmo das chamadas: a cada 5 min. Quando o Claude Code está ativo, pode atualizar a cada 90 s. Se receber 429, espera de 5 a 30 min antes de tentar de novo.
 2. **Statusline (opcional, tempo real)**: `statusline.js` recebe os `rate_limits` do próprio Claude Code (sem rede, sem token) e grava em `~/.claude/clawd-pace/feed.json`. Só funciona no Claude Code de terminal (a extensão do VS Code não roda statusline).
 3. **Atividade local**: lê `~/.claude/projects/**/*.jsonl` numa worker thread, de forma incremental (só os bytes novos), com cache. A primeira leitura de ~1,6 GB leva ~4 s em segundo plano; depois disso, ~6 ms.
@@ -96,6 +98,7 @@ npm test             # testes do motor de pace e das cores
 | `main.js` | janelas, caminhada, bandeja, polling, alertas, autostart |
 | `pace.js` | motor de pace (puro, testado em `test/`) |
 | `limits.js` | leitura dos limites do plano |
+| `refresh.js` | renova o login com o Claude Code fechado (testado com servidor falso em `test/`) |
 | `usage.js` + `usage-worker.js` | stats locais dos logs (worker thread) |
 | `history.js` | série temporal para burn-rate e gráficos |
 | `trayicon.js` | ícone da bandeja desenhado pixel a pixel |

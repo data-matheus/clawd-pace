@@ -46,7 +46,7 @@ function render() {
     renderRow('r-w', st.week);
   }
   let head = st.headline || '';
-  if (st.err === 'expired') head = 'Token expirou · abra o Claude Code';
+  if (st.err === 'expired') head = st.authNote === 'claude-open' ? 'Login expirou · use o Claude Code aberto' : st.authNote === 'renew-failed' ? 'Login expirou · faça login no Claude Code' : 'Renovando login…';
   else if (st.err === 'no-token') head = 'Faça login no Claude Code';
   $('headline').textContent = head;
   renderPet();
